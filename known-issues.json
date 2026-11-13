@@ -1,0 +1,18 @@
+{
+  "_comment": "Processes confirmed to leak handles. pcdoctor names them in 'check' and 'leaks'. Add yours with a pull request or an issue (pcdoctor report). Kernel drivers that keep exited processes in memory are listed in https://github.com/marloncodess/claude-code-zombies/blob/main/known-culprits.json",
+  "handleLeaks": [
+    {
+      "process": "mtkbtsvc",
+      "service": "MTKBTSVC",
+      "vendor": "MediaTek",
+      "device": "RZ608 Wi-Fi 6E / Bluetooth adapter (MediaTek MT7921, often sold as AMD RZ608)",
+      "driverVersions": ["1.1044.0.556"],
+      "os": ["Windows 10 22H2 build 19045"],
+      "handleType": "Event (99.9 % of its handles)",
+      "rate": "0 to 760,000 handles per hour, in bursts; 2.2 million system handles after 29 h uptime",
+      "evidence": "pcdoctor handles mtkbtsvc: 96,002 of 96,088 handles are Event objects; restarting the service drops it from 464,317 to 222 handles; growth is unrelated to process starts (0 new handles during 439 extra starts)",
+      "fix": "Update the Bluetooth driver from your mainboard or laptop vendor. Until then: pcdoctor watchdog install mtkbtsvc (restarts the service, Bluetooth devices drop for a few seconds).",
+      "reported": "2026-11-13"
+    }
+  ]
+}
