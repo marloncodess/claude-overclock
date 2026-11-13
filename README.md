@@ -1,155 +1,157 @@
-# claude-pc-doctor 🩺
+# claude-overclock ⚡
 
-**Is your Windows PC at 100 % CPU, RAM full, and Task Manager showing millions of handles while Claude Code runs?**
-`pcdoctor` tells you which session, agent, process or driver is responsible, in one command.
+**Your Windows PC is at 100 % CPU, 100 % disk, RAM full and Task Manager shows millions of handles while Claude Code runs?**
+`overclock` names the session, agent, process or driver responsible, and frees the machine without stopping your work.
 
-![Task Manager: CPU 100 %, RAM 96 %, 921 processes, 2,224,585 handles](assets/taskmanager-2m-handles.png)
+A Claude Code plugin with slash commands, and a single PowerShell file you can also run on its own.
+
+![Task Manager: CPU 100 %, RAM 96 %, disk 93 %, 921 processes, 2,224,585 handles](assets/taskmanager-2m-handles.png)
 
 *My PC after 29 hours: CPU 100 %, RAM 96 %, disk 93 %, 921 processes and **2.2 million handles** (normal is 100-300k).*
 
-## Quick start
+## Install
 
-Download `pcdoctor.ps1` and `known-issues.json` (or clone the repo) and run in PowerShell:
+**As a Claude Code plugin** (in any Claude Code session):
+
+```
+/plugin marketplace add marloncodess/claude-overclock
+/plugin install overclock@overclock
+```
+
+Then ask Claude "why is my PC so slow?" or use the commands directly: `/overclock:check`, `/overclock:disk`, `/overclock:throttle`, ...
+
+**Standalone:** download `overclock.ps1` and `known-issues.json` (or clone the repo) and run in PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\pcdoctor.ps1
+powershell -ExecutionPolicy Bypass -File .\overclock.ps1
 ```
 
-It samples your PC for 20 seconds and prints:
-
-```
-== Who uses the CPU (20 s, 100 % = all 16 threads)
- 11.9 %   101 proc  Claude session f868a144 ~\my-app [worktree] e2e-plan
-  6.9 %     1 proc  vmmem
-...
-== Handles (growth over 20 s)
-    63,690   +758,880/h  mtkbtsvc (MTKBTSVC)  <-- LEAK
-...
-== Findings
-[HIGH] mtkbtsvc leaks handles: 63,690 now, about 758,880 more per hour.
-       -> Update the Bluetooth driver ... Until then: pcdoctor watchdog install mtkbtsvc
-[HIGH] Up to 14 agents ran at the same time in the last hour (workflows/subagents).
-[WARN] 21 Claude Code sessions are running at the same time.
-[WARN] MCP server "claude-mem" runs 22 times (once per session).
-[WARN] 8 orphaned process trees (7.1 GB) from sessions that are gone.
-       -> pcdoctor orphans -Kill
-```
-
-Run it as administrator for everything; `check`, `sessions`, `agents`, `leaks` and `orphans` also work without.
+Run it as administrator for everything; `check`, `disk`, `sessions`, `agents`, `leaks`, `reap` and `throttle` also work without.
 
 ## Commands
 
-| Command | What it does | Changes anything? |
-|---|---|---|
-| `check` | 20-second health check: CPU, RAM and handles **by owner** (each Claude session with everything it started), MCP copies, agents, orphans, leaks, watchdogs | no |
-| `sessions` | every Claude Code session: model, project, processes, memory, MCP servers, dev servers with ports, tests, browsers, agents started by your own code | no |
-| `agents -Hours 24` | agent activity from the session logs: subagents per hour, workflows, peak concurrency, which session started the most agents | no |
-| `leaks` | 60-second handle sample, names every process whose handles keep growing, with the service it hosts | no |
-| `handles <name\|pid>` | breaks one process's handles down by object type (Event, File, Process, ...) | no (admin) |
-| `spawns` | counts every process start for 60 s and shows which session they come from | no (admin) |
-| `orphans` | process trees whose session or shell is gone: dev servers, test runs, headless browsers, with ports | no |
-| `orphans -Kill` | ends them, asks per tree, skips trees younger than 10 minutes and background services | yes |
-| `watchdog install <process>` | scheduled task (SYSTEM) that restarts a leaking service above `-Threshold` handles, every `-Every` minutes | yes (admin) |
-| `watchdog status` / `remove <process>` | shows last run of each watchdog and flags a deleted or stopped one | status: no |
-| `report` | writes `pcdoctor-report.md` for an issue, without user names, paths or project names | no |
+| Slash command | PowerShell | What it does | Changes anything? |
+|---|---|---|---|
+| `/overclock:check` | `check` | 20-second health check: CPU, RAM, disk I/O and handles **by owner** (each Claude session with everything it started), sessions, MCP copies, agents, orphans, leaks, disk errors | no |
+| `/overclock:disk` | `disk` | SSD model, health, temperature, DRAM cache, file system errors, TRIM, maintenance, page file, I/O by session, **what fills the disk** (Docker, Go/npm caches, worktrees, transcripts) | no |
+| `/overclock:fix` | `disk repair` | schedules the file system repair, turns maintenance back on, rebuilds broken performance counters, runs TRIM (only on a clean file system). `-DryRun` shows the plan | yes, asks per step (admin) |
+| `/overclock:throttle` | `throttle` | every Claude session and everything it started runs at **below-normal priority**: your apps come first, agents keep working on the spare CPU. `-Undo` reverts | priority only |
+| `/overclock:reap` | `reap` / `orphans` | dev servers, test runs and headless browsers whose session is gone. `-Kill` ends them (skips anything younger than 10 min) | with `-Kill` |
+| `/overclock:sessions` | `sessions` | every session: model, project, processes, memory, MCP servers, dev servers with ports, tests, browsers, agents started by your own code | no |
+| `/overclock:agents` | `agents -Hours 24` | subagents and workflows per hour from the session logs, peak concurrency, who spawned them | no |
+| `/overclock:leaks` | `leaks` | 60-second handle sample, every process whose handles keep growing, with its service | no |
+| | `handles <name\|pid>` | one process's handles by object type (Event, File, Process, ...) | no (admin) |
+| `/overclock:spawns` | `spawns` | every process start for 60 s, grouped by the session that caused it | no (admin) |
+| `/overclock:watchdog` | `watchdog install\|status\|remove` | scheduled task (SYSTEM) that restarts a leaking service above `-Threshold` handles, with a heartbeat so a deleted task shows up | install/remove (admin) |
+| `/overclock:report` | `report` | `overclock-report.md` for an issue, without user names, paths or project names | no |
 
-Everything is one PowerShell 5.1 file without dependencies. Windows 10 and 11.
+One PowerShell 5.1 file, no dependencies, Windows 10 and 11.
 
 ## What actually took my PC down
 
-I expected one bug. It was six things on top of each other. All numbers are from my PC (Ryzen 7 7800X3D, 32 GB, Windows 10 22H2), measured with the commands above.
+I expected one bug. It was a pile-up. All numbers are from my PC (Ryzen 7 7800X3D, 32 GB, Kingston NV2 1 TB, Windows 10 22H2), measured with the commands above.
 
-### 1. A Bluetooth driver leaking Event handles (the 2 million handles)
+### 1. Too much parallel work: 13 sessions at once
+
+```
+/overclock:check
+ 14.4 %    70 proc  Claude session f868a144 ~\my-app [worktree] e2e-pq-plan
+ 10.6 %     1 proc  vmmem
+  5.6 %    13 proc  Claude session fef1eda9 ~\my-app [worktree] scheduled-tasks
+...
+Sessions running: 20   agents started by your code: 12
+```
+
+**13 sessions worked at the same time**, most of them started as side sessions by one lead session: e2e tests, a second GitHub app, security reviews, landing page, mockups, CI. Each builds, tests, starts Docker databases or its own agents. One of them ran workflows with **24 agents** (8 at once, peak 14), each in its own copy of the repo; in 47 minutes they ran 1,120 shell commands. One e2e test started **12 real Claude agents** of its own.
+
+After a reboot, the desktop app **resumes every open session**, and the heaviest one started its next 22-agent workflow 3 minutes after the PC was back up. Rebooting does not help.
+
+**Fix without stopping anything:** `/overclock:throttle` set 286 Claude processes to below-normal priority. Builds and agents keep running, Windows serves your own apps first, and new processes inherit the lower priority. **Real fix:** fewer sessions and agents at once.
+
+![Task Manager: Claude (254) at 47 % CPU and 6.7 GB](assets/taskmanager-claude-254.png)
+
+### 2. The disk: full RAM, a cache-less SSD and a file system nobody repaired
+
+```
+/overclock:disk
+KINGSTON SNV2S1000G  NVMe SSD, 932 GB, Healthy  38 °C now, max 83 °C  (no DRAM cache)
+  C:    183.5 GB free of 820 GB (22%)   FILE SYSTEM ERRORS   no TRIM in 120 days
+Automatic maintenance: OFF   performance counters: BROKEN
+Page file: 8,578 MB in use (peak 13,476 MB since boot)
+```
+
+- **RAM at 94 %** made Windows page to the SSD (8.5 GB in use, 13.5 GB peak). That alone keeps "disk 100 %" in Task Manager while only ~30 MB/s flow.
+- The **Kingston NV2 has no DRAM cache**. Thousands of small parallel writes (git, `node_modules`, builds in 36 worktrees) are its worst case. It also reached **83 °C**, where NVMe drives throttle.
+- **C: has file system errors since 8 Nov**: NTFS asked for a scan at every boot (11 times), the dirty bit is set. It started the night C: was shrunk to make room for a Linux dual boot.
+- Nothing ever repaired it, because **Windows automatic maintenance was switched off**. That also means **no TRIM in 120 days**, which makes an SSD slower and slower.
+- The online scan (`chkdsk /scan`) could not even run: **there is no shadow copy storage** on any drive.
+- **Windows performance counters were broken**, so no monitoring tool except Task Manager could see the disk load.
+
+**Fix:** `/overclock:fix` schedules `chkdsk /spotfix` (about a minute at the next restart), turns maintenance back on and rebuilds the counters. **TRIM runs only after the file system is repaired**: TRIM on a damaged file system can release blocks that are still in use.
+
+### 3. A Bluetooth driver leaking Event handles (the 2 million handles)
 
 `mtkbtsvc.exe`, the service of the **MediaTek RZ608** Wi-Fi/Bluetooth adapter (driver 1.1044.0.556), held **464,317 handles**, three quarters of all handles on the PC.
 
 ```
-pcdoctor handles mtkbtsvc
+overclock handles mtkbtsvc
 == mtkbtsvc (pid 22444): 96,088 handles
     96,002   99.9 %  Event
 ```
 
-- It grows in bursts: from 0 to **760,000 handles per hour**. After 29 hours of uptime the PC had 2.2 million handles.
-- It has nothing to do with Claude Code: during 439 extra process starts it gained **0** handles.
-- Restarting the service drops it to about 200 handles, until it starts again.
+It grows in bursts, up to **760,000 handles per hour**, and has nothing to do with Claude Code: during 439 extra process starts it gained 0 handles. **Fix:** a newer Bluetooth driver. **Until then:** `overclock watchdog install mtkbtsvc`.
 
-**Fix:** a newer Bluetooth driver. **Until then:** `pcdoctor watchdog install mtkbtsvc` restarts the service whenever it passes 100,000 handles (Bluetooth devices drop for a few seconds).
+> My first watchdog task **disappeared shortly after I created it**, and I only noticed a day later when the handles were back at 2 million. That is why the watchdog writes a heartbeat and `check` reports `TASK MISSING` or `STALE`.
 
-> My first watchdog task **disappeared shortly after I created it** (its task folder was last changed 50 seconds after the test run), and I only noticed a day later, when the handles were back at 2 million. That is why `watchdog status` writes a heartbeat on every run and reports `TASK MISSING` or `STALE`.
+### 4. 9,000 process starts per minute
 
-### 2. One workflow with 24 agents (the 100 % CPU)
+`overclock spawns`: 3,026 process starts in 20 s, 2,051 of them `git.exe`, from tests that create throw-away repos plus every tool call (shell, `conhost`, each hook). If RAM also disappears without an owner, a driver may keep those processes in kernel memory: see [claude-code-zombies](https://github.com/marloncodess/claude-code-zombies). Not the case here (`zombieprobe`: 0 of 49).
 
-A single session started a workflow at 03:02 with **8 agents at once**, 24 in total, each in its own copy of the repo. In 47 minutes they ran **1,120 shell commands**: Go tests and fuzzers, vitest, Docker, Python. That is where the `api.test.exe` and `chrome-headless-shell.exe` in Task Manager came from.
+### 5. Every session runs every MCP server
 
-```
-pcdoctor agents
-== Subagents started per hour
-13.11. 02:00     9  #############
-13.11. 03:00    35  ##################################################
-== Workflows
-wf_0a238b36-ecd  done      24 agents  13.11. 03:02 - 03:49
-wf_bc3cc6b7-7ed  RUNNING   22 agents  13.11. 03:56 - 04:17
-```
+User-level MCP servers start **once per session**: 20 sessions x 3 servers = 60 extra processes, several GB. `check` flags any server that runs once per session.
 
-I rebooted at 03:49. **The desktop app resumed all 21 open sessions, and the same session started the next 22-agent workflow 3 minutes after the PC was back up.** Rebooting does not help while the sessions stay open.
+### 6. A plugin hook on every tool call
 
-![Task Manager: Claude (254) at 47 % CPU and 6.7 GB](assets/taskmanager-claude-254.png)
+`claude-mem` hooks into every `PostToolUse`. At the peak its log grew by 2,526 lines in 10 minutes while it was rate-limited 6,583 times, so its queue only grew; its vector database alone used 2.8 GB of RAM.
 
-### 3. 9,000 process starts per minute
+### 7. Orphaned dev servers and test runs
 
-```
-pcdoctor spawns
-== 3,026 process starts in 20 s = 9,078 per minute
-  2,051  git.exe
-    247  bash.exe
-    154  conhost.exe
-```
-
-Tests that create throw-away git repos, plus every tool call (shell, `conhost`, every hook). Each start costs CPU and a scan by the anti-virus. If your RAM also disappears without an owner, a driver may keep these processes in kernel memory: see [claude-code-zombies](https://github.com/marloncodess/claude-code-zombies). That was not the problem this time (`zombieprobe`: 0 of 49).
-
-### 4. Every session runs every MCP server
-
-MCP servers from your user config start **once per session**. With 23 sessions and 3 servers that was 69 extra processes; the `claude-mem` copies alone used 4.8 GB. `check` flags any server that runs once per session, and `sessions` shows them per session.
-
-### 5. A plugin hook on every tool call
-
-`claude-mem` hooks into every `PostToolUse`, starts a process and queues an observation. At the peak its log grew by **2,526 lines in 10 minutes**, and it logged **6,583** times that it was rate-limited ("provider cooldown"), so the queue only grew. Its databases reached 2.6 GB + 1.6 GB. Hooks multiply with the number of agents.
-
-### 6. Orphaned dev servers and test runs
-
-Process trees whose session or shell no longer exists: duplicated `npm run dev` servers from hours ago, hanging `vitest run`, a Go fuzzer, `npm run pixel` with 4 headless Chromes. First cleanup: 7 trees, 60 processes, 26,000 handles. A day later: 8 new ones, **7.1 GB**.
-
-**Not the cause** (tested): when Claude Code hits a command timeout it moves the command to the background instead of killing it, and stopping that background task ends the whole tree, also through `cmd`/`npx`. Where the orphans come from is still open. If you find out, please open an issue.
+Trees whose session or shell is gone: duplicated `npm run dev` servers from hours ago, hanging `vitest`, a Go fuzzer, 4 headless Chromes. `reap -Kill` freed 60 processes and 26,000 handles the first time; a day later there were 7 GB of them again. Claude Code's own timeouts and `TaskStop` clean up correctly (tested); where these come from is still open. Found out? Please open an issue.
 
 ## What to do, in order
 
-1. `pcdoctor` - read the findings.
-2. **Archive sessions you don't use.** The desktop app resumes all of them after a restart, each with its own MCP servers.
-3. **Cap parallel agents** in your workflows (e.g. 3-4). Each agent runs its own builds and tests.
-4. `pcdoctor orphans -Kill` - end leftover dev servers and test runs.
-5. Move MCP servers you need only in some projects from your user config into those projects' `.mcp.json`.
-6. Check hooks in `~/.claude/settings.json` and plugin hooks: each one runs on every matching tool call.
-7. `pcdoctor leaks` - if a process leaks handles, update its driver; `pcdoctor watchdog install <process>` bridges the time.
-8. Cap WSL/Docker memory with `memory=8GB` in `%UserProfile%\.wslconfig`.
+1. `/overclock:check` - read the findings.
+2. `/overclock:throttle` - your PC is usable again right away, nothing is stopped.
+3. **Run fewer sessions and agents at once.** Archive sessions you don't use: the desktop app resumes all of them after a restart. Cap parallel agents in workflows (3-4).
+4. `/overclock:fix` - repair the file system, maintenance, counters; after the restart run it again for TRIM.
+5. `/overclock:reap` - end leftover dev servers and test runs.
+6. Move MCP servers you need only in some projects into those projects' `.mcp.json`. Check hooks in `~/.claude/settings.json` and plugins.
+7. `/overclock:leaks` - a leaking driver needs an update; `watchdog install` bridges the time.
+8. Cap WSL/Docker memory with `memory=8GB` in `%UserProfile%\.wslconfig`. Give the SSD a heatsink if `disk` shows 70 °C+.
 
 ## Safety
 
-- `check`, `sessions`, `agents`, `leaks`, `handles`, `spawns`, `orphans` and `report` only read.
-- `orphans -Kill` asks before every tree and never touches trees younger than `-MinAgeMinutes` (default 10) or background services.
-- `watchdog install` refuses a process that hosts several services (like `svchost`), because restarting it would restart all of them.
-- `report` replaces your user name, PC name and paths, and calls projects `project-A`, `project-B`, ... It does list your MCP server names.
+- Read-only: `check`, `disk`, `sessions`, `agents`, `leaks`, `handles`, `spawns`, `reap`, `watchdog status`, `report`, `disk repair -DryRun`.
+- `throttle` only changes process priority and is undone with `-Undo`.
+- `reap -Kill` asks per tree and never touches trees younger than `-MinAgeMinutes` (default 10) or background services.
+- `disk repair` asks before every step, never runs TRIM on a damaged file system, and the file system repair itself runs at the next restart.
+- `watchdog install` refuses a process that hosts several services (like `svchost`).
+- The slash commands tell Claude to show what will change and wait for your yes before anything that changes your system. Claude never stops or archives your sessions on its own.
+- `report` replaces user name, PC name and paths and calls projects `project-A`, `project-B`; it does list MCP server names.
 
 ## Known issues
 
-| Process | Device / driver | Version | Leak | Fix |
-|---|---|---|---|---|
-| `mtkbtsvc.exe` | MediaTek RZ608 Bluetooth | 1.1044.0.556 | Event handles, up to 760k/h | update the driver; `watchdog install mtkbtsvc` |
+| What | Device / driver | Problem | Fix |
+|---|---|---|---|
+| `mtkbtsvc.exe` | MediaTek RZ608 Bluetooth, 1.1044.0.556 | Event handles, up to 760k/h | update the driver; `watchdog install mtkbtsvc` |
+| SSDs without DRAM cache | Kingston NV1/NV2/NV3, Crucial P2/P3, WD Blue SN5x0, Samsung 980, ... | slow under many small parallel writes | fewer parallel agents/worktrees; a DRAM SSD for heavy agent work |
 
-`check` and `leaks` look up [`known-issues.json`](known-issues.json). **Found a new one?** Run `pcdoctor report` and open an issue.
+`check`, `leaks` and `disk` look up [`known-issues.json`](known-issues.json). **Found a new one?** Run `/overclock:report` and open an issue.
 
 ## Related
 
-- [claude-code-zombies](https://github.com/marloncodess/claude-code-zombies): RAM fills up but no process owns it? A driver may keep every exited process in kernel memory. 30-second test and driver finder.
+- [claude-code-zombies](https://github.com/marloncodess/claude-code-zombies): RAM fills up but no process owns it? A driver may keep every exited process in kernel memory.
 
 ## License
 

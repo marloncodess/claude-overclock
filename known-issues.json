@@ -1,5 +1,5 @@
 {
-  "_comment": "Processes confirmed to leak handles. pcdoctor names them in 'check' and 'leaks'. Add yours with a pull request or an issue (pcdoctor report). Kernel drivers that keep exited processes in memory are listed in https://github.com/marloncodess/claude-code-zombies/blob/main/known-culprits.json",
+  "_comment": "Known problems that overclock names in 'check', 'leaks' and 'disk'. Add yours with a pull request or an issue (overclock report). Kernel drivers that keep exited processes in memory are listed in https://github.com/marloncodess/claude-code-zombies/blob/main/known-culprits.json",
   "handleLeaks": [
     {
       "process": "mtkbtsvc",
@@ -10,9 +10,23 @@
       "os": ["Windows 10 22H2 build 19045"],
       "handleType": "Event (99.9 % of its handles)",
       "rate": "0 to 760,000 handles per hour, in bursts; 2.2 million system handles after 29 h uptime",
-      "evidence": "pcdoctor handles mtkbtsvc: 96,002 of 96,088 handles are Event objects; restarting the service drops it from 464,317 to 222 handles; growth is unrelated to process starts (0 new handles during 439 extra starts)",
-      "fix": "Update the Bluetooth driver from your mainboard or laptop vendor. Until then: pcdoctor watchdog install mtkbtsvc (restarts the service, Bluetooth devices drop for a few seconds).",
+      "evidence": "overclock handles mtkbtsvc: 96,002 of 96,088 handles are Event objects; restarting the service drops it from 464,317 to 222 handles; growth is unrelated to process starts (0 new handles during 439 extra starts)",
+      "fix": "Update the Bluetooth driver from your mainboard or laptop vendor. Until then: overclock watchdog install mtkbtsvc (restarts the service, Bluetooth devices drop for a few seconds).",
       "reported": "2026-11-13"
     }
+  ],
+  "_dramlessComment": "Regular expressions matched against the disk's model name. These SSDs have no DRAM cache and slow down a lot under many small parallel writes (git, node_modules, builds in many worktrees).",
+  "dramlessSsds": [
+    "KINGSTON SNV2S",
+    "KINGSTON SNV3S",
+    "KINGSTON SNVS",
+    "CT\\d+P3P?SSD8",
+    "CT\\d+P2SSD8",
+    "WD Blue SN5[0-8]0",
+    "WD Blue SN5000",
+    "WDS\\d+G3B0C",
+    "WDS\\d+T3B0C",
+    "Samsung SSD 980 \\d",
+    "Lexar SSD NM6[12]0"
   ]
 }

@@ -1,32 +1,41 @@
-<#
+﻿<#
 .SYNOPSIS
-  pcdoctor - finds out why your Windows PC hits 100 % CPU, full RAM or millions of handles while
-  Claude Code (or any coding agent) runs, and names the session, process or driver responsible.
+  claude-overclock - finds out why your Windows PC hits 100 % CPU, full RAM, a busy disk or millions of
+  handles while Claude Code (or any coding agent) runs, names the session, process or driver responsible,
+  and fixes what can be fixed.
 
 .DESCRIPTION
   Commands:
-    check               (default) 20-second health check: CPU, RAM and handles by owner, Claude sessions,
-                        MCP servers, agents, orphans, leaks. Read-only.
+    check               (default) 20-second health check: CPU, RAM, disk I/O and handles by owner, Claude
+                        sessions, MCP servers, agents, orphans, leaks, disk errors. Read-only.
+    disk                SSD health and temperature, file system errors, TRIM, maintenance, I/O by owner and
+                        what fills the disk (caches, worktrees, Docker). Read-only. -NoSpace skips the sizes.
+    disk repair         fixes what 'disk' found: schedules the file system repair, turns maintenance back on,
+                        rebuilds broken performance counters, runs TRIM. Asks before each step. Admin.
+                        -DryRun only shows the steps.
+    throttle            gives your own apps priority: every Claude Code session and everything it started
+                        (builds, tests, agents, browsers) runs at below-normal priority. Nothing is stopped; new
+                        processes inherit it. -Undo sets them back to normal.
     sessions            every Claude Code session with its child processes, MCP servers and memory.
     agents              agent activity from the session logs: subagents and workflows per hour, peak concurrency.
     leaks               samples handle counts for 60 s and names every process whose handles keep growing.
     handles <name|pid>  breaks one process's handles down by object type. Admin.
     spawns              counts every process start for 60 s and shows which session starts them. Admin.
-    orphans             process trees whose session is gone (dev servers, test runs, headless browsers).
+    orphans | reap      process trees whose session is gone (dev servers, test runs, headless browsers).
                         Add -Kill to end them (asks per tree, skips trees younger than -MinAgeMinutes).
     watchdog install <process>   restarts a leaking service once it holds -Threshold handles. Admin.
     watchdog status              lists every watchdog and when it last ran.
     watchdog remove <process>    removes a watchdog.
-    report              writes pcdoctor-report.md without user names, paths or project names.
+    report              writes overclock-report.md without user names, paths or project names.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\pcdoctor.ps1
-  powershell -ExecutionPolicy Bypass -File .\pcdoctor.ps1 orphans -Kill
-  powershell -ExecutionPolicy Bypass -File .\pcdoctor.ps1 watchdog install mtkbtsvc -Threshold 100000
+  powershell -ExecutionPolicy Bypass -File .\overclock.ps1
+  powershell -ExecutionPolicy Bypass -File .\overclock.ps1 orphans -Kill
+  powershell -ExecutionPolicy Bypass -File .\overclock.ps1 watchdog install mtkbtsvc -Threshold 100000
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0)][ValidateSet('check', 'sessions', 'agents', 'leaks', 'handles', 'spawns', 'orphans', 'watchdog', 'report', 'help')][string]$Command = 'check',
+    [Parameter(Position = 0)][ValidateSet('check', 'disk', 'throttle', 'sessions', 'agents', 'leaks', 'handles', 'spawns', 'orphans', 'reap', 'watchdog', 'report', 'help')][string]$Command = 'check',
     [Parameter(Position = 1)][string]$Target = '',
     [Parameter(Position = 2)][string]$Name = '',
     [int]$Seconds = 0,
@@ -36,23 +45,26 @@ param(
     [int]$MinAgeMinutes = 10,
     [string]$Service = '',
     [switch]$Kill,
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$DryRun,
+    [switch]$NoSpace,
+    [switch]$Undo
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.1.0'
-$RepoUrl = 'https://github.com/marloncodess/claude-pc-doctor'
+$Version = '0.2.0'
+$RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$StateDir = Join-Path $env:ProgramData 'pcdoctor'
-$TaskPath = '\pcdoctor\'
+$StateDir = Join-Path $env:ProgramData 'claude-overclock'
+$TaskPath = '\claude-overclock\'
 $ClaudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }
 $Cores = [Environment]::ProcessorCount
 
 # ---------------------------------------------------------------- native helpers (handle types)
-if (-not ('PcDoctor.Native' -as [type])) {
+if (-not ('Overclock.Native' -as [type])) {
     Add-Type -TypeDefinition @'
 using System; using System.Collections.Generic; using System.Runtime.InteropServices;
-namespace PcDoctor {
+namespace Overclock {
 public class TypeInfo { public int Index; public string Name; public long Objects; public long Handles; }
 public static class Native {
   [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
@@ -269,15 +281,26 @@ function Get-OwnerLabel($s, $x) {
 }
 
 # ---------------------------------------------------------------- sampling
+function Get-IoCounters {
+    $h = @{}
+    foreach ($p in Get-CimInstance Win32_Process -Property ProcessId, Name, ReadTransferCount, WriteTransferCount) { $h[[int]$p.ProcessId] = @([string]$p.Name, [double]$p.ReadTransferCount, [double]$p.WriteTransferCount) }
+    $h
+}
 function Measure-Window([int]$sec) {
     $a = @{}; foreach ($p in Get-Process) { $c = 0.0; try { $c = [double]$p.CPU } catch { }; $a[$p.Id] = @($p.ProcessName, $p.HandleCount, $c) }
+    $io1 = Get-IoCounters
     Start-Sleep -Seconds $sec
+    $io2 = Get-IoCounters
     $res = New-Object System.Collections.Generic.List[object]
     foreach ($p in Get-Process) {
         if (-not $a.ContainsKey($p.Id)) { continue }
         $o = $a[$p.Id]; if ($o[0] -ne $p.ProcessName) { continue }
         $c = 0.0; try { $c = [double]$p.CPU } catch { }
-        $res.Add([pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; Handles = $p.HandleCount; HDelta = $p.HandleCount - $o[1]; CpuDelta = [math]::Max(0, $c - $o[2]) })
+        $rd = 0.0; $wr = 0.0
+        if ($io1.ContainsKey($p.Id) -and $io2.ContainsKey($p.Id) -and $io1[$p.Id][0] -eq $io2[$p.Id][0]) {
+            $rd = [math]::Max(0, $io2[$p.Id][1] - $io1[$p.Id][1]) / 1MB; $wr = [math]::Max(0, $io2[$p.Id][2] - $io1[$p.Id][2]) / 1MB
+        }
+        $res.Add([pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; Handles = $p.HandleCount; HDelta = $p.HandleCount - $o[1]; CpuDelta = [math]::Max(0, $c - $o[2]); ReadMB = $rd; WriteMB = $wr })
     }
     [pscustomobject]@{ Seconds = $sec; Rows = $res }
 }
@@ -317,7 +340,7 @@ function Invoke-Check([int]$sec) {
     $findings = New-Object System.Collections.Generic.List[object]
     function Add-Finding([string]$sev, [string]$title, [string]$fix) { $findings.Add([pscustomobject]@{ Sev = $sev; Title = $title; Fix = $fix }) }
 
-    Write-Host "pcdoctor $Version  -  sampling for $sec s ..." -ForegroundColor DarkGray
+    Write-Host "overclock $Version  -  sampling for $sec s ..." -ForegroundColor DarkGray
     $w = Measure-Window $sec
     $s = Get-Snap
     $os = Get-CimInstance Win32_OperatingSystem
@@ -332,16 +355,16 @@ function Invoke-Check([int]$sec) {
     Write-Host ('{0:N0} processes   {1:N0} threads   {2:N0} handles' -f $s.List.Count, $threads, $handles)
     if ($ramPct -ge 90) { Add-Finding 'HIGH' "RAM is $ramPct % full." 'See "Who holds the RAM" above.' } elseif ($ramPct -ge 80) { Add-Finding 'WARN' "RAM is $ramPct % full." 'See "Who holds the RAM" above.' }
     if ($commitPct -ge 90) { Add-Finding 'HIGH' "Commit charge is at $commitPct % - Windows is about to run out of memory." 'Close sessions or programs now.' }
-    if ($handles -ge 1000000) { Add-Finding 'HIGH' ('{0:N0} handles in total (normal: 100-300k).' -f $handles) 'pcdoctor leaks' } elseif ($handles -ge 400000) { Add-Finding 'WARN' ('{0:N0} handles in total (normal: 100-300k).' -f $handles) 'pcdoctor leaks' }
+    if ($handles -ge 1000000) { Add-Finding 'HIGH' ('{0:N0} handles in total (normal: 100-300k).' -f $handles) 'overclock leaks' } elseif ($handles -ge 400000) { Add-Finding 'WARN' ('{0:N0} handles in total (normal: 100-300k).' -f $handles) 'overclock leaks' }
 
-    $cpuById = @{}; foreach ($r in $w.Rows) { $cpuById[$r.Id] = $r.CpuDelta }
+    $rowById = @{}; foreach ($r in $w.Rows) { $rowById[$r.Id] = $r }
     $owners = @{}
     foreach ($x in $s.List) {
-        if ($x.Id -le 4) { continue }
-        $o = Get-OwnerLabel $s $x
-        if (-not $owners.ContainsKey($o)) { $owners[$o] = [pscustomobject]@{ Owner = $o; N = 0; Cpu = 0.0; MB = 0.0; Handles = 0 } }
+        if ($x.Id -eq 0) { continue }
+        $o = if ($x.Id -eq 4) { 'System (Windows kernel, paging)' } else { Get-OwnerLabel $s $x }
+        if (-not $owners.ContainsKey($o)) { $owners[$o] = [pscustomobject]@{ Owner = $o; N = 0; Cpu = 0.0; MB = 0.0; Handles = 0; IO = 0.0 } }
         $e = $owners[$o]; $e.N++; $e.MB += $x.PrivMB; $e.Handles += $x.Handles
-        if ($cpuById.ContainsKey($x.Id)) { $e.Cpu += $cpuById[$x.Id] }
+        if ($rowById.ContainsKey($x.Id)) { $r = $rowById[$x.Id]; $e.Cpu += $r.CpuDelta; $e.IO += $r.ReadMB + $r.WriteMB }
     }
     $cap = [double]$sec * $Cores
     Write-Head "== Who uses the CPU ($sec s, 100 % = all $Cores threads)"
@@ -356,7 +379,14 @@ function Invoke-Check([int]$sec) {
     foreach ($e in ($owners.Values | Sort-Object MB -Descending | Select-Object -First 8)) {
         Write-Host ('{0,9}  {1,4} proc  {2}' -f (Format-MB $e.MB), $e.N, (Limit-Text $e.Owner 90))
     }
-    $vm = $s.List | Where-Object { $_.Name -eq 'vmmem' -or $_.Name -eq 'vmmemWSL' } | Measure-Object PrivMB -Sum
+    Write-Head "== Who reads and writes ($sec s, files + pipes + network)"
+    foreach ($e in ($owners.Values | Sort-Object IO -Descending | Select-Object -First 6)) {
+        if ($e.IO -lt 0.1) { continue }
+        Write-Host ('{0,7:N1} MB/s  {1,4} proc  {2}' -f ($e.IO / $sec), $e.N, (Limit-Text $e.Owner 90))
+    }
+    $df = Get-DiskFacts
+    if ($null -ne $df.Busy) { Write-Host ('Disk busy: {0:N0} %' -f $df.Busy) }
+    foreach ($f in (Get-DiskFindings $df)) { Add-Finding $f.Sev $f.Title $f.Fix }
     $vmProc = Get-Process -Name vmmem, vmmemWSL -ErrorAction SilentlyContinue | Measure-Object WorkingSet64 -Sum
     if ($vmProc.Sum -ge 4GB) { Add-Finding 'INFO' ('WSL/Docker VM (vmmem) uses {0}.' -f (Format-MB ($vmProc.Sum / 1MB))) 'Cap it with memory=8GB in %UserProfile%\.wslconfig, then "wsl --shutdown".' }
 
@@ -369,7 +399,7 @@ function Invoke-Check([int]$sec) {
     }
     $wd = @(Get-Watchdogs)
     foreach ($r in ($leak | Where-Object { $_.Verdict -eq 'LEAK' })) {
-        $fix = "pcdoctor watchdog install $($r.Name)"
+        $fix = "overclock watchdog install $($r.Name)"
         if ($r.Known) { $fix = "$($r.Known.fix)" }
         $guard = $wd | Where-Object { $_.Process -eq $r.Name -and $_.State -eq 'ok' } | Select-Object -First 1
         if ($guard) {
@@ -379,7 +409,7 @@ function Invoke-Check([int]$sec) {
         }
     }
     foreach ($d in $wd) {
-        if ($d.State -ne 'ok') { Add-Finding 'HIGH' "Watchdog for $($d.Process): $($d.State)." "pcdoctor watchdog install $($d.Process)   (something removed or stopped it)" }
+        if ($d.State -ne 'ok') { Add-Finding 'HIGH' "Watchdog for $($d.Process): $($d.State)." "overclock watchdog install $($d.Process)   (something removed or stopped it)" }
     }
 
     Write-Head '== Claude'
@@ -408,17 +438,17 @@ function Invoke-Check([int]$sec) {
             Add-Finding 'WARN' ('MCP server "{0}" runs {1} times (once per session).' -f $g.Name, $g.Count) 'If you need it only in some projects, move it from your user config to those projects'' .mcp.json.'
         }
     }
-    if ($act.Peak -ge 8) { Add-Finding 'HIGH' "Up to $($act.Peak) agents ran at the same time in the last hour (workflows/subagents)." 'pcdoctor agents   - each agent runs its own builds and tests; cap parallel agents in your workflow.' }
-    if ($nested.Count -ge 1) { Add-Finding 'WARN' "$($nested.Count) Claude Code processes were started by code or tests that a session ran (not by you)." 'pcdoctor sessions   - look for "agent-in-code"; e2e tests that spawn real agents multiply everything.' }
+    if ($act.Peak -ge 8) { Add-Finding 'HIGH' "Up to $($act.Peak) agents ran at the same time in the last hour (workflows/subagents)." 'overclock agents   - each agent runs its own builds and tests; cap parallel agents in your workflow.' }
+    if ($nested.Count -ge 1) { Add-Finding 'WARN' "$($nested.Count) Claude Code processes were started by code or tests that a session ran (not by you)." 'overclock sessions   - look for "agent-in-code"; e2e tests that spawn real agents multiply everything.' }
     $dev = @($s.List | Where-Object { $_.Role -eq 'dev-server' -and $_.Name -ne 'cmd.exe' -and $_.Name -notmatch 'bash|sh\.exe' })
     $br = @($s.List | Where-Object { $_.Role -eq 'browser' -and $_.Cmd -notmatch '--type=' })
     $tests = @($s.List | Where-Object { $_.Role -eq 'test' -and $_.Name -notmatch '^(bash|sh|cmd)\.exe$' })
-    if ($dev.Count -ge 4) { Add-Finding 'WARN' "$($dev.Count) dev-server processes started by sessions." 'pcdoctor orphans   - several may be duplicates of the same app.' }
-    if ($br.Count -ge 4) { Add-Finding 'WARN' "$($br.Count) headless browsers started by sessions." 'Close finished browser/Playwright sessions; pcdoctor orphans finds left-overs.' }
+    if ($dev.Count -ge 4) { Add-Finding 'WARN' "$($dev.Count) dev-server processes started by sessions." 'overclock orphans   - several may be duplicates of the same app.' }
+    if ($br.Count -ge 4) { Add-Finding 'WARN' "$($br.Count) headless browsers started by sessions." 'Close finished browser/Playwright sessions; overclock orphans finds left-overs.' }
     if ($tests.Count -ge 6) { Add-Finding 'INFO' "$($tests.Count) test processes are running right now." 'Normal while agents test; many at once means parallel agents.' }
     $omb = 0; foreach ($o in $orph | Where-Object { -not $_.Expected }) { $omb += $o.MB }
     $on = @($orph | Where-Object { -not $_.Expected }).Count
-    if ($on) { Add-Finding 'WARN' ('{0} orphaned process trees ({1}) from sessions that are gone.' -f $on, (Format-MB $omb)) 'pcdoctor orphans -Kill' }
+    if ($on) { Add-Finding 'WARN' ('{0} orphaned process trees ({1}) from sessions that are gone.' -f $on, (Format-MB $omb)) 'overclock orphans -Kill' }
 
     Write-Head '== Findings'
     if (-not $findings.Count) { Write-Good 'Nothing unusual found.' }
@@ -534,18 +564,18 @@ function Invoke-Leaks {
             Write-Warn2 "$($r.Name) is a known leak: $($r.Known.device), driver $($r.Known.driverVersions -join ', ')."
             Write-Host "   Fix: $($r.Known.fix)"
         }
-        if ($r.Service -and $r.Service -notmatch ',') { Write-Host "   Stop-gap: pcdoctor watchdog install $($r.Name)   (restarts the service $($r.Service) above -Threshold handles)" }
-        Write-Host "   Details: pcdoctor handles $($r.Name)"
+        if ($r.Service -and $r.Service -notmatch ',') { Write-Host "   Stop-gap: overclock watchdog install $($r.Name)   (restarts the service $($r.Service) above -Threshold handles)" }
+        Write-Host "   Details: overclock handles $($r.Name)"
     }
     Write-Host ''
     Write-Host 'Short-lived processes that stay in kernel memory do not show up here; for that see' $ZombieRepo -ForegroundColor DarkGray
 }
 function Invoke-Handles {
     Assert-Admin
-    if (-not $Target) { Write-Bad 'Usage: pcdoctor handles <process name or pid>'; exit 2 }
+    if (-not $Target) { Write-Bad 'Usage: overclock handles <process name or pid>'; exit 2 }
     $p = if ($Target -match '^\d+$') { Get-Process -Id ([int]$Target) } else { Get-Process -Name ($Target -replace '\.exe$', '') | Sort-Object HandleCount -Descending | Select-Object -First 1 }
-    $types = @{}; foreach ($t in [PcDoctor.Native]::Types()) { $types[$t.Index] = $t }
-    $h = [PcDoctor.Native]::HandleTypes($p.Id)
+    $types = @{}; foreach ($t in [Overclock.Native]::Types()) { $types[$t.Index] = $t }
+    $h = [Overclock.Native]::HandleTypes($p.Id)
     $total = 0; foreach ($v in $h.Values) { $total += $v }
     Write-Head ('== {0} (pid {1}): {2:N0} handles' -f $p.ProcessName, $p.Id, $total)
     foreach ($k in ($h.Keys | Sort-Object { $h[$_] } -Descending | Select-Object -First 12)) {
@@ -567,7 +597,7 @@ function Invoke-Spawns {
     $sec = if ($Seconds) { $Seconds } else { 60 }
     $s = Get-Snap
     $map = @{}; foreach ($x in $s.List) { $map[$x.Id] = @($x.Name, $x.PPid) }
-    $sid = 'pcdoctor-spawn'
+    $sid = 'overclock-spawn'
     Register-CimIndicationEvent -ClassName Win32_ProcessStartTrace -SourceIdentifier $sid | Out-Null
     Write-Host "Counting process starts for $sec s ..." -ForegroundColor DarkGray
     $events = New-Object System.Collections.Generic.List[object]
@@ -643,13 +673,20 @@ function Invoke-Orphans {
     Write-Host ''
     Write-Host ('{0} trees can be ended safely, {1} together.' -f $killable.Count, (Format-MB $mb))
     if (-not $Kill) { if ($killable.Count) { Write-Host 'Run with -Kill to end them (asks per tree; -Yes skips the questions).' -ForegroundColor DarkGray }; return }
-    $done = 0
+    $done = 0; $failed = 0
     foreach ($o in $killable) {
         if (-not (Confirm-Step ("End pid $($o.Root.Id) and its $($o.Count - 1) child processes?"))) { continue }
-        & taskkill.exe /PID $o.Root.Id /T /F 2>&1 | Out-Null
-        $done++
+        # taskkill writes to stderr when a child already exited; under PS 5.1 that must not abort the loop
+        $null = & cmd.exe /c "taskkill /PID $($o.Root.Id) /T /F >nul 2>&1"
+        $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($o.Root.Id)" -ErrorAction SilentlyContinue
+        if ($still -and $still.CreationDate -eq $o.Root.Created) {
+            Stop-Process -Id $o.Root.Id -Force -ErrorAction SilentlyContinue
+            $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($o.Root.Id)" -ErrorAction SilentlyContinue
+        }
+        if ($still -and $still.CreationDate -eq $o.Root.Created) { $failed++; Write-Warn2 "pid $($o.Root.Id) is still running." } else { $done++ }
     }
     Write-Good "Ended $done tree(s)."
+    if ($failed) { Write-Warn2 "$failed tree(s) could not be ended; run as administrator." }
 }
 
 # ---------------------------------------------------------------- watchdog
@@ -677,7 +714,7 @@ function Invoke-Watchdog {
         'install' {
             Assert-Admin
             $proc = ($Name -replace '\.exe$', '')
-            if (-not $proc) { Write-Bad 'Usage: pcdoctor watchdog install <process> [-Service NAME] [-Threshold 100000] [-Every 5]'; exit 2 }
+            if (-not $proc) { Write-Bad 'Usage: overclock watchdog install <process> [-Service NAME] [-Threshold 100000] [-Every 5]'; exit 2 }
             $svc = $Service
             if (-not $svc) {
                 $p = Get-Process -Name $proc -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -694,15 +731,15 @@ function Invoke-Watchdog {
             $t2 = New-ScheduledTaskTrigger -AtStartup
             $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
             $st = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
-            Register-ScheduledTask -TaskPath $TaskPath -TaskName "watchdog-$proc" -Action $action -Trigger $t1, $t2 -Principal $pr -Settings $st -Description "pcdoctor: restarts service $svc when $proc holds more than $Threshold handles." -Force | Out-Null
+            Register-ScheduledTask -TaskPath $TaskPath -TaskName "watchdog-$proc" -Action $action -Trigger $t1, $t2 -Principal $pr -Settings $st -Description "overclock: restarts service $svc when $proc holds more than $Threshold handles." -Force | Out-Null
             $beat = Join-Path $StateDir "watchdog-$proc.last"
             if (Test-Path $beat) { Remove-Item $beat -Force }
             Start-ScheduledTask -TaskPath $TaskPath -TaskName "watchdog-$proc"
             for ($i = 0; $i -lt 30 -and -not (Test-Path $beat); $i++) { Start-Sleep -Seconds 1 }
-            if (-not (Test-Path $beat)) { Write-Warn2 'The first run has not reported back yet; check "pcdoctor watchdog status" in a minute.' }
+            if (-not (Test-Path $beat)) { Write-Warn2 'The first run has not reported back yet; check "overclock watchdog status" in a minute.' }
             Write-Good "Watchdog installed: every $Every min, restarts $svc above $('{0:N0}' -f $Threshold) handles of $proc."
             Write-Host "   script: $file"
-            Write-Host '   check it any time with: pcdoctor watchdog status'
+            Write-Host '   check it any time with: overclock watchdog status'
         }
         'remove' {
             Assert-Admin
@@ -725,6 +762,260 @@ function Invoke-Watchdog {
     }
 }
 
+# ---------------------------------------------------------------- disk
+function Test-Dramless([string]$model) {
+    $f = Join-Path $ScriptDir 'known-issues.json'
+    if (-not (Test-Path $f)) { return $false }
+    foreach ($p in @((Get-Content $f -Raw | ConvertFrom-Json).dramlessSsds)) { if ($model -match $p) { return $true } }
+    $false
+}
+function Get-DiskFacts {
+    $admin = Test-Admin
+    $disks = foreach ($d in @(Get-PhysicalDisk -ErrorAction SilentlyContinue)) {
+        $r = $null; if ($admin) { try { $r = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { } }
+        [pscustomobject]@{
+            Name = [string]$d.FriendlyName; Media = [string]$d.MediaType; Bus = [string]$d.BusType; GB = [math]::Round($d.Size / 1GB); Health = [string]$d.HealthStatus
+            Temp = $(if ($r) { $r.Temperature }); TempMax = $(if ($r) { $r.TemperatureMax }); Wear = $(if ($r) { $r.Wear })
+            Errors = $(if ($r) { [int]$r.ReadErrorsUncorrected + [int]$r.WriteErrorsUncorrected }); Dramless = (Test-Dramless $d.FriendlyName)
+        }
+    }
+    $ntfs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Ntfs'; Id = 98; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)
+    $trim = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-Defrag'; Id = 258; StartTime = (Get-Date).AddDays(-120) } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'retrim' })
+    $w32 = @{}; foreach ($v in @(Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue)) { if ($v.DriveLetter) { $w32[$v.DriveLetter.TrimEnd(':')] = $v } }
+    $vols = foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' } | Sort-Object DriveLetter)) {
+        $l = [string]$v.DriveLetter
+        $ev = @($ntfs | Where-Object { $_.Message -match "\b${l}:" } | Sort-Object TimeCreated -Descending)
+        $needs = $false; $since = $null
+        if ($ev.Count -and $ev[0].Level -le 3) {
+            $needs = $true
+            $healthy = $ev | Where-Object { $_.Level -gt 3 } | Select-Object -First 1
+            $bad = $ev | Where-Object { $_.Level -le 3 -and (-not $healthy -or $_.TimeCreated -gt $healthy.TimeCreated) }
+            $since = ($bad | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
+        }
+        $lt = $trim | Where-Object { $_.Message -match "\(${l}:\)" } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+        [pscustomobject]@{
+            Letter = $l; FS = [string]$v.FileSystem; SizeGB = [math]::Round($v.Size / 1GB, 1); FreeGB = [math]::Round($v.SizeRemaining / 1GB, 1)
+            FreePct = $(if ($v.Size) { [math]::Round(100 * $v.SizeRemaining / $v.Size) } else { 0 }); Health = [string]$v.HealthStatus
+            Dirty = $(if ($w32.ContainsKey($l)) { [bool]$w32[$l].DirtyBitSet } else { $false }); NeedsScan = $needs; ScanSince = $since; ScanEvents = @($ev | Where-Object { $_.Level -le 3 }).Count
+            LastTrim = $(if ($lt) { $lt.TimeCreated } else { $null })
+        }
+    }
+    $maint = $false
+    try { $maint = ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' -ErrorAction Stop).MaintenanceDisabled -eq 1) } catch { }
+    $trimOn = $null
+    if ($admin) { $q = (& fsutil.exe behavior query DisableDeleteNotify 2>&1) -join ' '; if ($q -match 'NTFS DisableDeleteNotify\s*=\s*(\d)') { $trimOn = $matches[1] -eq '0' } }
+    $perf = [bool](Get-CimClass -ClassName Win32_PerfRawData_PerfDisk_PhysicalDisk -ErrorAction SilentlyContinue)
+    $busy = $null
+    if ($perf) {
+        try { $idle = foreach ($i in 1..3) { (Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name='_Total'").PercentIdleTime; Start-Sleep -Milliseconds 600 }; $busy = [math]::Max(0, 100 - ($idle | Measure-Object -Average).Average) } catch { }
+    }
+    $shadow = $null; if ($admin) { $shadow = @(Get-CimInstance Win32_ShadowStorage -ErrorAction SilentlyContinue).Count -gt 0 }
+    [pscustomobject]@{
+        Disks = @($disks); Volumes = @($vols); MaintenanceDisabled = $maint; TrimEnabled = $trimOn; PerfCounters = $perf; Busy = $busy
+        ShadowStorage = $shadow; PageFile = (Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue | Select-Object -First 1)
+        SearchRunning = ((Get-Service WSearch -ErrorAction SilentlyContinue).Status -eq 'Running'); Admin = $admin
+    }
+}
+function Get-DiskFindings($f) {
+    $res = New-Object System.Collections.Generic.List[object]
+    function Add-F([string]$sev, [string]$t, [string]$fix) { $res.Add([pscustomobject]@{ Sev = $sev; Title = $t; Fix = $fix }) }
+    $ssd = @($f.Disks | Where-Object { $_.Media -eq 'SSD' -or $_.Bus -eq 'NVMe' }).Count -gt 0
+    foreach ($d in $f.Disks) {
+        if ($d.Health -and $d.Health -ne 'Healthy') { Add-F 'HIGH' "Disk $($d.Name) reports health '$($d.Health)'." 'Back up now; check the vendor tool for SMART details.' }
+        if ($d.Errors -gt 0) { Add-F 'HIGH' "Disk $($d.Name) has $($d.Errors) uncorrected read/write errors." 'Back up now and check the drive with the vendor tool.' }
+        if ($d.TempMax -ge 80) { Add-F 'WARN' "SSD $($d.Name) reached $($d.TempMax) °C (now $($d.Temp) °C). NVMe drives slow down at about 70-80 °C." 'Add a heatsink or airflow over the M.2 slot.' }
+        if ($d.Dramless) { Add-F 'WARN' "$($d.Name) is an SSD without DRAM cache. Many small parallel writes (git, node_modules, builds in many worktrees) make it slow and push the disk to 100 %." 'Fewer parallel agents and worktrees; for heavy agent work a drive with DRAM cache is much faster.' }
+    }
+    foreach ($v in $f.Volumes) {
+        if ($v.NeedsScan -or $v.Dirty) {
+            $why = @(); if ($v.NeedsScan) { $why += "NTFS asks for a scan since $($v.ScanSince.ToString('dd.MM. HH:mm')) ($($v.ScanEvents)x)" }; if ($v.Dirty) { $why += 'dirty bit is set' }
+            Add-F 'HIGH' "Drive $($v.Letter): has file system errors: $($why -join ', ')." 'overclock disk repair   (schedules chkdsk /spotfix; takes about a minute at the next restart)'
+        }
+        if ($v.FreePct -lt 10) { Add-F 'HIGH' "Drive $($v.Letter): only $($v.FreeGB) GB ($($v.FreePct) %) free." 'overclock disk   - see what fills it' } elseif ($v.FreePct -lt 15) { Add-F 'WARN' "Drive $($v.Letter): only $($v.FreeGB) GB ($($v.FreePct) %) free." 'overclock disk   - see what fills it' }
+        if ($ssd -and $f.TrimEnabled -ne $false -and $v.FS -eq 'NTFS') {
+            if (-not $v.LastTrim) { Add-F 'WARN' "No TRIM on drive $($v.Letter): in the last 120 days. Without TRIM an SSD gets slower over time." 'overclock disk repair   (runs TRIM once the file system is clean)' }
+            elseif (((Get-Date) - $v.LastTrim).TotalDays -gt 14) { Add-F 'INFO' "Last TRIM on drive $($v.Letter): $([math]::Floor(((Get-Date) - $v.LastTrim).TotalDays)) days ago." 'overclock disk repair' }
+        }
+    }
+    if ($f.TrimEnabled -eq $false) { Add-F 'WARN' 'TRIM is switched off for NTFS (DisableDeleteNotify = 1).' 'fsutil behavior set DisableDeleteNotify 0   (admin)' }
+    if ($f.MaintenanceDisabled) { Add-F 'HIGH' 'Windows automatic maintenance is switched off: no file system scans, no TRIM, no cleanup ever run.' 'overclock disk repair   (turns it back on)' }
+    if (-not $f.PerfCounters) { Add-F 'WARN' 'Windows performance counters for disk and memory are broken: only Task Manager can see disk load, monitoring tools see nothing.' 'overclock disk repair   (rebuilds them with lodctr /R)' }
+    if ($f.ShadowStorage -eq $false) { Add-F 'INFO' 'No shadow copy storage on any drive: online disk scans (chkdsk /scan) and restore points cannot run.' 'Turn on System Protection for C: (System Properties > System Protection), 5-10 % is enough.' }
+    $res
+}
+function Get-FolderBytes([string]$p) {
+    if (-not $p -or -not (Test-Path -LiteralPath $p)) { return $null }
+    $it = Get-Item -LiteralPath $p -Force
+    if ($it -is [IO.FileInfo]) { return [double]$it.Length }
+    $o = & robocopy.exe $p 'C:\__overclock_nul__' /L /S /NJH /NFL /NDL /NC /BYTES /R:0 /W:0 /XJ 2>$null
+    $line = $o | Select-String '^\s*Bytes\s*:' | Select-Object -First 1
+    if ($line) { [double](($line.Line -split ':')[1].Trim() -split '\s+')[0] } else { $null }
+}
+function Get-WorktreeRoots {
+    $f = Join-Path $env:USERPROFILE '.claude.json'
+    if (-not (Test-Path $f)) { return @() }
+    try { $j = Get-Content $f -Raw | ConvertFrom-Json } catch { return @() }
+    if (-not $j.projects) { return @() }
+    @($j.projects.PSObject.Properties.Name | Where-Object { $_ -match '[\\/]\.claude[\\/]worktrees[\\/]' } | ForEach-Object { (($_ -split '[\\/]\.claude[\\/]worktrees[\\/]')[0] -replace '/', '\') + '\.claude\worktrees' } | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath $_ })
+}
+function Get-SpaceUsage {
+    $goCache = "$env:LOCALAPPDATA\go-build"; $goMod = "$env:USERPROFILE\go\pkg\mod"
+    if (Get-Command go -ErrorAction SilentlyContinue) { try { $goCache = (& go env GOCACHE).Trim(); $goMod = (& go env GOMODCACHE).Trim() } catch { } }
+    $items = @(
+        @('Docker / WSL disks', "$env:LOCALAPPDATA\Docker\wsl", 'docker system prune -a, then compact the .vhdx (diskpart compact vdisk)'),
+        @('Go build cache', $goCache, 'go clean -cache'),
+        @('Go module cache', $goMod, 'go clean -modcache'),
+        @('npm cache', "$env:LOCALAPPDATA\npm-cache", 'npm cache clean --force'),
+        @('pnpm store', "$env:LOCALAPPDATA\pnpm\store", 'pnpm store prune'),
+        @('Yarn cache', "$env:LOCALAPPDATA\Yarn\Cache", 'yarn cache clean'),
+        @('Bun cache', "$env:USERPROFILE\.bun\install\cache", 'bun pm cache rm'),
+        @('pip cache', "$env:LOCALAPPDATA\pip\cache", 'pip cache purge'),
+        @('Playwright browsers', "$env:LOCALAPPDATA\ms-playwright", 'npx playwright uninstall (old versions)'),
+        @('Temp folder', $env:TEMP, 'Disk Cleanup / delete old files in %TEMP%'),
+        @('Claude Code transcripts', (Join-Path $ClaudeHome 'projects'), 'cleanupPeriodDays in ~/.claude/settings.json'),
+        @('claude-mem data', "$env:USERPROFILE\.claude-mem", 'see the claude-mem docs before deleting'),
+        @('Claude desktop app data', "$env:APPDATA\Claude", '')
+    )
+    $res = New-Object System.Collections.Generic.List[object]
+    foreach ($i in $items) { $b = Get-FolderBytes $i[1]; if ($b -gt 50MB) { $res.Add([pscustomobject]@{ What = $i[0]; GB = [math]::Round($b / 1GB, 1); Path = $i[1]; Fix = $i[2]; Count = $null }) } }
+    foreach ($r in Get-WorktreeRoots) {
+        $n = @(Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue).Count
+        if (-not $n) { continue }
+        $b = Get-FolderBytes $r
+        $res.Add([pscustomobject]@{ What = "Claude worktrees ($n)"; GB = [math]::Round($b / 1GB, 1); Path = $r; Fix = 'git worktree remove <path> for finished ones, then git worktree prune'; Count = $n })
+    }
+    $res
+}
+function Invoke-Disk {
+    if ($Target -eq 'repair') { Invoke-DiskRepair; return }
+    $sec = if ($Seconds) { $Seconds } else { 10 }
+    if (-not (Test-Admin)) { Write-Warn2 'Not elevated: SSD temperature, TRIM state and shadow storage need an elevated PowerShell.' }
+    Write-Host "Sampling disk I/O for $sec s ..." -ForegroundColor DarkGray
+    $w = Measure-Window $sec
+    $f = Get-DiskFacts
+    $s = Get-Snap
+    Write-Head '== Drives'
+    foreach ($d in $f.Disks) {
+        $t = if ($null -ne $d.Temp) { "  $($d.Temp) °C now, max $($d.TempMax) °C" } else { '' }
+        $dr = if ($d.Dramless) { '  (no DRAM cache)' } else { '' }
+        Write-Host ('{0}  {1} {2}, {3} GB, {4}{5}{6}' -f $d.Name, $d.Bus, $d.Media, $d.GB, $d.Health, $t, $dr)
+    }
+    foreach ($v in $f.Volumes) {
+        $st = if ($v.NeedsScan -or $v.Dirty) { 'FILE SYSTEM ERRORS' } else { 'ok' }
+        $tr = if ($v.LastTrim) { 'last TRIM ' + $v.LastTrim.ToString('dd.MM.yy') } else { 'no TRIM in 120 days' }
+        $c = if ($st -ne 'ok') { 'Red' } else { 'Gray' }
+        Write-Host ('  {0}:  {1,7:N1} GB free of {2,6:N0} GB ({3,2}%)   {4}   {5}' -f $v.Letter, $v.FreeGB, $v.SizeGB, $v.FreePct, $st, $tr) -ForegroundColor $c
+    }
+    $pm = if ($f.MaintenanceDisabled) { 'OFF' } else { 'on' }
+    $pc = if ($f.PerfCounters) { 'ok' } else { 'BROKEN' }
+    Write-Host ('Automatic maintenance: {0}   performance counters: {1}   Windows Search: {2}' -f $pm, $pc, $(if ($f.SearchRunning) { 'running' } else { 'off' }))
+    if ($null -ne $f.Busy) { Write-Host ('Disk busy right now: {0:N0} %' -f $f.Busy) }
+    if ($f.PageFile) { Write-Host ('Page file: {0:N0} MB in use (peak {1:N0} MB since boot)' -f $f.PageFile.CurrentUsage, $f.PageFile.PeakUsage) }
+
+    Write-Head "== Who reads and writes ($sec s, files + pipes + network)"
+    $own = @{}
+    foreach ($r in $w.Rows) {
+        $x = $s.ById[$r.Id]; if (-not $x) { continue }
+        $o = if ($r.Id -eq 4) { 'System (Windows kernel, paging)' } else { Get-OwnerLabel $s $x }
+        if (-not $own.ContainsKey($o)) { $own[$o] = [pscustomobject]@{ Owner = $o; R = 0.0; W = 0.0; Top = @{} } }
+        $own[$o].R += $r.ReadMB; $own[$o].W += $r.WriteMB
+        $k = $x.Name; $own[$o].Top[$k] = [double]$own[$o].Top[$k] + $r.ReadMB + $r.WriteMB
+    }
+    foreach ($e in ($own.Values | Sort-Object { $_.R + $_.W } -Descending | Select-Object -First 10)) {
+        if ($e.R + $e.W -lt 0.5) { continue }
+        $top = ($e.Top.Keys | Sort-Object { $e.Top[$_] } -Descending | Select-Object -First 3) -join ', '
+        Write-Host ('{0,6:N1} MB/s read {1,6:N1} MB/s write  {2}  [{3}]' -f ($e.R / $sec), ($e.W / $sec), (Limit-Text $e.Owner 70), $top)
+    }
+
+    if (-not $NoSpace) {
+        Write-Head '== What fills the disk (this can take a minute)'
+        foreach ($u in (Get-SpaceUsage | Sort-Object GB -Descending)) {
+            Write-Host ('{0,7:N1} GB  {1,-28} {2}' -f $u.GB, $u.What, (Hide-Paths $u.Path))
+            if ($u.Fix) { Write-Host ('            -> ' + $u.Fix) -ForegroundColor DarkGray }
+        }
+    }
+
+    Write-Head '== Findings'
+    $fs = @(Get-DiskFindings $f)
+    if (-not $fs.Count) { Write-Good 'No disk problems found.' }
+    foreach ($sev in 'HIGH', 'WARN', 'INFO') {
+        foreach ($x in $fs | Where-Object { $_.Sev -eq $sev }) {
+            $c = switch ($sev) { 'HIGH' { 'Red' } 'WARN' { 'Yellow' } default { 'Gray' } }
+            Write-Host ("[$sev] " + $x.Title) -ForegroundColor $c
+            if ($x.Fix) { Write-Host ('       -> ' + $x.Fix) -ForegroundColor DarkGray }
+        }
+    }
+}
+function Invoke-DiskRepair {
+    if (-not $DryRun) { Assert-Admin }
+    $f = Get-DiskFacts
+    $steps = 0
+    function Step([string]$what, [scriptblock]$do) {
+        $script:stepsDone++
+        if ($DryRun) { Write-Host "[dry-run] would: $what" -ForegroundColor Yellow; return }
+        if (-not (Confirm-Step $what)) { Write-Host '   skipped' -ForegroundColor DarkGray; return }
+        try { & $do } catch { Write-Bad "   failed: $($_.Exception.Message)" }
+    }
+    $script:stepsDone = 0
+    $broken = @($f.Volumes | Where-Object { $_.NeedsScan -or $_.Dirty })
+    foreach ($v in $broken) {
+        Step "Schedule a file system repair of $($v.Letter): (chkdsk /spotfix, runs at the next restart, about a minute)" {
+            $o = (& cmd.exe /c "echo Y| chkdsk $($v.Letter): /spotfix" 2>&1) -join "`n"
+            Write-Host ($o -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 3 | Out-String).Trim()
+            Write-Warn2 '   Restart Windows to run it. Archive Claude sessions you do not need first: the desktop app resumes all of them.'
+        }
+    }
+    if ($f.MaintenanceDisabled) {
+        Step 'Turn Windows automatic maintenance back on (scans, TRIM, cleanup)' {
+            Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' -Name MaintenanceDisabled -ErrorAction Stop
+            Write-Good '   Maintenance is on again.'
+        }
+    }
+    if (-not $f.PerfCounters) {
+        Step 'Rebuild the Windows performance counters (lodctr /R, winmgmt /resyncperf)' {
+            & "$env:WINDIR\System32\lodctr.exe" /R | Out-Null
+            if (Test-Path "$env:WINDIR\SysWOW64\lodctr.exe") { & "$env:WINDIR\SysWOW64\lodctr.exe" /R | Out-Null }
+            & "$env:WINDIR\System32\wbem\winmgmt.exe" /resyncperf | Out-Null
+            Start-Sleep -Seconds 3
+            if (Get-CimClass -ClassName Win32_PerfRawData_PerfDisk_PhysicalDisk -ErrorAction SilentlyContinue) { Write-Good '   Performance counters are back.' } else { Write-Warn2 '   Not visible yet; they usually appear after a restart.' }
+        }
+    }
+    $ssdVols = @($f.Volumes | Where-Object { $_.FS -eq 'NTFS' -and (-not $_.LastTrim -or ((Get-Date) - $_.LastTrim).TotalDays -gt 14) })
+    if ($ssdVols.Count -and @($f.Disks | Where-Object { $_.Media -eq 'SSD' -or $_.Bus -eq 'NVMe' }).Count) {
+        if ($broken.Count) {
+            Write-Warn2 'TRIM is postponed: it must not run while the file system has errors (it could release blocks that are still in use). Run "disk repair" again after the restart.'
+        } else {
+            foreach ($v in $ssdVols) { Step "Run TRIM on $($v.Letter): (Optimize-Volume -ReTrim, a few minutes, safe to keep working)" { Optimize-Volume -DriveLetter $v.Letter -ReTrim -Verbose; Write-Good "   TRIM on $($v.Letter): done." } }
+        }
+    }
+    if (-not $script:stepsDone -and -not $broken.Count) { Write-Good 'Nothing to repair.' }
+}
+
+# ---------------------------------------------------------------- throttle
+function Invoke-Throttle {
+    $s = Get-Snap
+    $want = if ($Undo) { [Diagnostics.ProcessPriorityClass]::Normal } else { [Diagnostics.ProcessPriorityClass]::BelowNormal }
+    $from = if ($Undo) { [Diagnostics.ProcessPriorityClass]::BelowNormal } else { [Diagnostics.ProcessPriorityClass]::Normal }
+    $ids = New-Object System.Collections.Generic.HashSet[int]
+    foreach ($x in $s.List) { if ($x.Kind -eq 'cli' -or $x.Cli) { [void]$ids.Add($x.Id) } }
+    foreach ($o in Get-Orphans $s) { if (-not $o.Expected) { foreach ($t in $o.Tree) { [void]$ids.Add($t.Id) } } }
+    [void]$ids.Remove($PID)
+    $done = 0; $skipped = 0
+    foreach ($id in $ids) {
+        try {
+            $p = Get-Process -Id $id -ErrorAction Stop
+            if ($p.PriorityClass -eq $from) { $p.PriorityClass = $want; $done++ } else { $skipped++ }
+        } catch { $skipped++ }
+    }
+    if ($Undo) { Write-Good "$done Claude processes are back at normal priority." }
+    else {
+        Write-Good "$done Claude processes now run below normal priority; your own apps come first."
+        Write-Host 'Builds, tests and agents keep running and use the CPU you are not using. Processes they start inherit the lower priority.' -ForegroundColor DarkGray
+        Write-Host 'New sessions start at normal priority: run "throttle" again after opening new ones. Undo with: throttle -Undo' -ForegroundColor DarkGray
+    }
+    if ($skipped) { Write-Host "$skipped processes left as they were (already changed, exited or protected)." -ForegroundColor DarkGray }
+}
+
 # ---------------------------------------------------------------- report
 function Invoke-Report {
     $r = Invoke-Check $(if ($Seconds) { $Seconds } else { 30 })
@@ -736,8 +1027,8 @@ function Invoke-Report {
     $cc = @($s.List | Where-Object { $_.Kind -eq 'cli' -and $_.Path -match 'claude-code\\([\d.]+)' } | ForEach-Object { $matches[1] } | Sort-Object -Unique) -join ', '
     $appv = @($s.List | Where-Object { $_.Kind -eq 'app' -and $_.Path -match 'app-([\d.]+)' } | ForEach-Object { $matches[1] } | Sort-Object -Unique) -join ', '
     $L = New-Object System.Collections.Generic.List[string]
-    $L.Add('## pcdoctor report'); $L.Add('')
-    $L.Add("- pcdoctor $Version, $($os.Caption) build $($os.BuildNumber)"); $L.Add("- CPU: $cpu ($Cores threads), RAM: $(Format-MB ($os.TotalVisibleMemorySize / 1KB))")
+    $L.Add('## overclock report'); $L.Add('')
+    $L.Add("- overclock $Version, $($os.Caption) build $($os.BuildNumber)"); $L.Add("- CPU: $cpu ($Cores threads), RAM: $(Format-MB ($os.TotalVisibleMemorySize / 1KB))")
     $L.Add("- Claude desktop app: $appv   Claude Code: $cc")
     $L.Add(('- RAM {0}% used, commit {1}%, {2:N0} processes, {3:N0} handles, up {4}' -f $r.RamPct, $r.CommitPct, $s.List.Count, $r.Handles, (Format-Age $os.LastBootUpTime)))
     $L.Add(''); $L.Add('### Findings'); $L.Add('')
@@ -758,7 +1049,7 @@ function Invoke-Report {
     foreach ($g in $mcpGroups) { $L.Add("- MCP server ``$($g.Name)``: $($g.Count) copies") }
     $bt = Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { $_.DeviceClass -eq 'Bluetooth' -and $_.Manufacturer -notmatch 'Microsoft' } | Select-Object -First 3
     if ($bt) { $L.Add(''); $L.Add('### Bluetooth drivers'); $L.Add(''); foreach ($b in $bt) { $L.Add("- $($b.DeviceName) - $($b.Manufacturer) - $($b.DriverVersion)") } }
-    $out = Join-Path (Get-Location).Path 'pcdoctor-report.md'
+    $out = Join-Path (Get-Location).Path 'overclock-report.md'
     $L | Set-Content -Path $out -Encoding UTF8
     Write-Host ''
     Write-Good "Report written: $out"
@@ -773,6 +1064,9 @@ switch ($Command) {
     'handles' { Invoke-Handles }
     'spawns' { Invoke-Spawns }
     'orphans' { Invoke-Orphans }
+    'reap' { Invoke-Orphans }
+    'disk' { Invoke-Disk }
+    'throttle' { Invoke-Throttle }
     'watchdog' { Invoke-Watchdog }
     'report' { Invoke-Report }
     'help' { Get-Help $MyInvocation.MyCommand.Path -Detailed }

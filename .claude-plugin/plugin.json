@@ -1,0 +1,11 @@
+{
+  "name": "overclock",
+  "displayName": "claude-overclock",
+  "version": "0.2.0",
+  "description": "Windows PC at 100 % CPU, full RAM, disk at 100 % or millions of handles while Claude Code runs? Finds the session, agent, process or driver responsible and frees the machine without stopping your work.",
+  "author": { "name": "claude-overclock contributors" },
+  "homepage": "https://github.com/marloncodess/claude-overclock",
+  "repository": "https://github.com/marloncodess/claude-overclock",
+  "license": "MIT",
+  "keywords": ["windows", "performance", "cpu", "memory", "disk", "ssd", "handles", "agents"]
+}

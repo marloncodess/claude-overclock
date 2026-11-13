@@ -1,0 +1,13 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "overclock",
+  "description": "claude-overclock: CPU, RAM, disk and handle doctor for Claude Code on Windows",
+  "owner": { "name": "claude-overclock contributors", "url": "https://github.com/marloncodess/claude-overclock" },
+  "plugins": [
+    {
+      "name": "overclock",
+      "source": "./",
+      "description": "CPU, RAM, disk and handle doctor for Claude Code on Windows"
+    }
+  ]
+}
