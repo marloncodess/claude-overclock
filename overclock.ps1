@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
 $EveryBound = $PSBoundParameters.ContainsKey('Every')
-$Version = '0.3.0'
+$Version = '0.3.1'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -75,7 +75,24 @@ public class TypeInfo { public int Index; public string Name; public long Object
 public static class Native {
   [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
   [DllImport("ntdll.dll")] static extern int NtQueryObject(IntPtr h, int cls, IntPtr buf, int len, out int ret);
+  [DllImport("ntdll.dll")] static extern int NtSetInformationProcess(IntPtr h, int cls, ref int info, int len);
+  [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int cls, ref int info, int len, out int ret);
+  [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
   const int TooSmall = unchecked((int)0xC0000004);
+
+  // I/O priority of another process: 0 very low, 1 low (background), 2 normal. Returns the previous value, -1 on failure.
+  public static int SetIoPriority(int pid, int want, int onlyIf) {
+    IntPtr h = OpenProcess(0x0400 | 0x0200, false, pid);
+    if (h == IntPtr.Zero) return -1;
+    try {
+      int cur = 0, ret;
+      if (NtQueryInformationProcess(h, 33, ref cur, 4, out ret) != 0) return -1;
+      if (onlyIf >= 0 && cur != onlyIf) return cur;
+      int v = want;
+      return NtSetInformationProcess(h, 33, ref v, 4) == 0 ? cur : -1;
+    } finally { CloseHandle(h); }
+  }
 
   public static TypeInfo[] Types() {
     var res = new List<TypeInfo>();
@@ -1022,7 +1039,9 @@ function Invoke-DiskRepair {
 function Set-ClaudePriority($s, $ids, [bool]$undo) {
     $want = if ($undo) { [Diagnostics.ProcessPriorityClass]::Normal } else { [Diagnostics.ProcessPriorityClass]::BelowNormal }
     $from = if ($undo) { [Diagnostics.ProcessPriorityClass]::BelowNormal } else { [Diagnostics.ProcessPriorityClass]::Normal }
-    $done = 0; $skipped = 0
+    # disk: background I/O priority (1), so your own reads and writes are served first; undo sets it back to normal (2)
+    $ioWant = if ($undo) { 2 } else { 1 }; $ioFrom = if ($undo) { 1 } else { 2 }
+    $done = 0; $skipped = 0; $io = 0
     foreach ($id in $ids) {
         if ($id -eq $PID) { continue }
         try {
@@ -1030,9 +1049,10 @@ function Set-ClaudePriority($s, $ids, [bool]$undo) {
             $x = $s.ById[$id]
             if ($x -and [math]::Abs(($p.StartTime - $x.Created).TotalSeconds) -gt 1) { $skipped++; continue }
             if ($p.PriorityClass -eq $from) { $p.PriorityClass = $want; $done++ } else { $skipped++ }
+            if ([Overclock.Native]::SetIoPriority($id, $ioWant, $ioFrom) -eq $ioFrom) { $io++ }
         } catch { $skipped++ }
     }
-    @($done, $skipped)
+    @($done, $skipped, $io)
 }
 function Invoke-Throttle {
     $s = Get-Snap
@@ -1040,10 +1060,10 @@ function Invoke-Throttle {
     foreach ($x in $s.List) { if ($x.Kind -eq 'cli' -or $x.Cli) { [void]$ids.Add($x.Id) } }
     foreach ($o in Get-Orphans $s) { if (-not $o.Expected) { foreach ($t in $o.Tree) { [void]$ids.Add($t.Id) } } }
     $r = Set-ClaudePriority $s $ids ([bool]$Undo)
-    $done = $r[0]; $skipped = $r[1]
-    if ($Undo) { Write-Good "$done Claude processes are back at normal priority." }
+    $done = $r[0]; $skipped = $r[1]; $io = $r[2]
+    if ($Undo) { Write-Good "$done Claude processes are back at normal CPU priority, $io at normal disk priority." }
     else {
-        Write-Good "$done Claude processes now run below normal priority; your own apps come first."
+        Write-Good "$done Claude processes now run below normal CPU priority, $io at background disk priority; your own apps come first."
         Write-Host 'Builds, tests and agents keep running and use the CPU you are not using. Processes they start inherit the lower priority.' -ForegroundColor DarkGray
         Write-Host 'New sessions start at normal priority: run "throttle" again after opening new ones. Undo with: throttle -Undo' -ForegroundColor DarkGray
     }
@@ -1094,7 +1114,7 @@ function Invoke-AutopilotRun {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     if ((Test-Path $log) -and (Get-Item $log).Length -gt 1MB) { Move-Item $log "$log.old" -Force }
     foreach ($r in $reaped) { Add-Content -Path $log -Value "$stamp  $r" }
-    if ($pr[0]) { Add-Content -Path $log -Value "$stamp  lowered priority of $($pr[0]) Claude process(es)" }
+    if ($pr[0] -or $pr[2]) { Add-Content -Path $log -Value "$stamp  lowered CPU priority of $($pr[0]), disk priority of $($pr[2]) Claude process(es)" }
     $sess = @($s.List | Where-Object { $_.Role -eq 'session' }).Count
     Set-Content -Path (Join-Path $ApDir 'autopilot.last') -Value ("{0}  sessions={1}  ended={2}  lowered={3}  watching={4}" -f $stamp, $sess, $reaped.Count, $pr[0], $keep.Count)
 }
