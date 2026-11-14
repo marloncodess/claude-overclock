@@ -20,13 +20,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/overc
    - CPU or RAM taken by many sessions or agents: `sessions`, `agents`; free the machine without stopping work with `throttle`.
    - Disk at 100 %, file system errors, no TRIM: `disk`, then `disk repair -DryRun`.
    - Handles growing: `leaks`, then `handles <process>`.
-   - Left-over dev servers and test runs: `reap` (lists), `reap -Kill -Yes` (ends).
+   - Left-over dev servers and test runs: `reap -Kill -Yes`; to have it done automatically every 10 min: `autopilot install`.
    - Many short processes: `spawns` (admin).
 
 ## Rules
 
 - Read-only: `check`, `disk`, `sessions`, `agents`, `leaks`, `handles`, `spawns`, `reap` without `-Kill`, `watchdog status`, `report`, `disk repair -DryRun`.
-- Ask the user for a clear yes before: `reap -Kill -Yes`, `throttle`, `disk repair -Yes`, `watchdog install|remove`. Show what will change first.
+- Without asking: `reap -Kill -Yes` (it only ends orphaned trees older than 10 minutes, never background services) and `throttle` when the user complains about a slow PC.
+- Ask the user for a clear yes before: `disk repair -Yes`, `watchdog install|remove`, `autopilot install|remove` (unless the user typed that command). Show what will change first.
 - Never stop or archive the user's Claude sessions on your own; name the heavy ones and let the user decide.
 - `disk repair`, `watchdog`, `spawns` and `handles` need an elevated PowerShell. If the shell is not elevated, give the user the exact command to run as administrator.
 - RAM above 90 % on an SSD makes Windows page to disk; that alone can hold the disk at 100 %. Freeing RAM is often the real disk fix.

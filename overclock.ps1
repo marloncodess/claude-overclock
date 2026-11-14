@@ -16,6 +16,10 @@
     throttle            gives your own apps priority: every Claude Code session and everything it started
                         (builds, tests, agents, browsers) runs at below-normal priority. Nothing is stopped; new
                         processes inherit it. -Undo sets them back to normal.
+    autopilot install   scheduled task for your user (no admin needed): every 10 min (-Every) it ends orphaned
+                        trees older than 30 min (-MinAgeMinutes) that it saw inside a Claude session before,
+                        and keeps Claude sessions at below-normal priority. Logs every action.
+    autopilot status    last run and what it did.   autopilot remove   turns it off.
     sessions            every Claude Code session with its child processes, MCP servers and memory.
     agents              agent activity from the session logs: subagents and workflows per hour, peak concurrency.
     leaks               samples handle counts for 60 s and names every process whose handles keep growing.
@@ -35,7 +39,7 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0)][ValidateSet('check', 'disk', 'throttle', 'sessions', 'agents', 'leaks', 'handles', 'spawns', 'orphans', 'reap', 'watchdog', 'report', 'help')][string]$Command = 'check',
+    [Parameter(Position = 0)][ValidateSet('check', 'disk', 'throttle', 'autopilot', 'sessions', 'agents', 'leaks', 'handles', 'spawns', 'orphans', 'reap', 'watchdog', 'report', 'help')][string]$Command = 'check',
     [Parameter(Position = 1)][string]$Target = '',
     [Parameter(Position = 2)][string]$Name = '',
     [int]$Seconds = 0,
@@ -51,7 +55,9 @@ param(
     [switch]$Undo
 )
 $ErrorActionPreference = 'Stop'
-$Version = '0.2.0'
+$MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
+$EveryBound = $PSBoundParameters.ContainsKey('Every')
+$Version = '0.3.0'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -156,6 +162,8 @@ function Get-KnownIssues {
     if (Test-Path $f) { (Get-Content $f -Raw | ConvertFrom-Json).handleLeaks } else { @() }
 }
 
+$KernelNames = @('System', 'Idle', 'Registry', 'Memory Compression', 'Secure System', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass')
+$ApDir = Join-Path $env:LOCALAPPDATA 'claude-overclock'
 $ShellNames = @('bash.exe', 'sh.exe', 'zsh.exe', 'powershell.exe', 'pwsh.exe', 'cmd.exe', 'conhost.exe', 'OpenConsole.exe')
 $WatchNames = @('node.exe', 'bun.exe', 'deno.exe', 'bash.exe', 'sh.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'python.exe', 'python3.exe', 'py.exe', 'uv.exe', 'uvx.exe', 'go.exe', 'esbuild.exe', 'chrome-headless-shell.exe', 'chrome.exe', 'msedge.exe', 'java.exe', 'cargo.exe', 'ruby.exe', 'dotnet.exe', 'docker.exe')
 
@@ -310,9 +318,12 @@ function Get-LeakRows($w) {
     $known = @(Get-KnownIssues)
     foreach ($r in $w.Rows) {
         $rate = [math]::Round($r.HDelta * 3600 / [math]::Max(1, $w.Seconds))
-        $verdict = if ($r.Handles -ge 100000 -or ($rate -ge 50000 -and $r.Handles -ge 5000)) { 'LEAK' } elseif ($rate -ge 10000 -and $r.Handles -ge 10000) { 'suspicious' } else { '' }
+        # kernel processes swing by tens of thousands of handles; only a very high count means a leaking driver
+        $kernel = $r.Id -le 4 -or $KernelNames -contains $r.Name
+        $verdict = if ($kernel) { if ($r.Handles -ge 100000) { 'LEAK' } else { '' } }
+        elseif ($r.Handles -ge 100000 -or ($rate -ge 50000 -and $r.Handles -ge 5000)) { 'LEAK' } elseif ($rate -ge 10000 -and $r.Handles -ge 10000) { 'suspicious' } else { '' }
         $k = $known | Where-Object { $_.process -eq $r.Name } | Select-Object -First 1
-        [pscustomobject]@{ Id = $r.Id; Name = $r.Name; Service = $svc[$r.Id]; Handles = $r.Handles; PerHour = $rate; Verdict = $verdict; Known = $k }
+        [pscustomobject]@{ Id = $r.Id; Name = $r.Name; Service = $svc[$r.Id]; Handles = $r.Handles; PerHour = $rate; Verdict = $verdict; Known = $k; Kernel = $kernel }
     }
 }
 
@@ -399,7 +410,11 @@ function Invoke-Check([int]$sec) {
     }
     $wd = @(Get-Watchdogs)
     foreach ($r in ($leak | Where-Object { $_.Verdict -eq 'LEAK' })) {
-        $fix = "overclock watchdog install $($r.Name)"
+        if ($r.Kernel) {
+            Add-Finding 'WARN' ('The Windows kernel ({0}) holds {1:N0} handles: a driver is leaking them.' -f $r.Name, $r.Handles) "overclock handles $($r.Name)   (admin; shows the object type), then update drivers. No watchdog for kernel processes."
+            continue
+        }
+        $fix = if ($r.Service -and $r.Service -notmatch ',') { "overclock watchdog install $($r.Name)" } else { "overclock handles $($r.Name)   (shows what it holds); update or restart that program" }
         if ($r.Known) { $fix = "$($r.Known.fix)" }
         $guard = $wd | Where-Object { $_.Process -eq $r.Name -and $_.State -eq 'ok' } | Select-Object -First 1
         if ($guard) {
@@ -446,9 +461,16 @@ function Invoke-Check([int]$sec) {
     if ($dev.Count -ge 4) { Add-Finding 'WARN' "$($dev.Count) dev-server processes started by sessions." 'overclock orphans   - several may be duplicates of the same app.' }
     if ($br.Count -ge 4) { Add-Finding 'WARN' "$($br.Count) headless browsers started by sessions." 'Close finished browser/Playwright sessions; overclock orphans finds left-overs.' }
     if ($tests.Count -ge 6) { Add-Finding 'INFO' "$($tests.Count) test processes are running right now." 'Normal while agents test; many at once means parallel agents.' }
-    $omb = 0; foreach ($o in $orph | Where-Object { -not $_.Expected }) { $omb += $o.MB }
-    $on = @($orph | Where-Object { -not $_.Expected }).Count
-    if ($on) { Add-Finding 'WARN' ('{0} orphaned process trees ({1}) from sessions that are gone.' -f $on, (Format-MB $omb)) 'overclock orphans -Kill' }
+    $ready = @($orph | Where-Object { -not $_.Expected -and -not $_.Young })
+    $young = @($orph | Where-Object { -not $_.Expected -and $_.Young }).Count
+    $later = if ($young) { "; $young younger one(s) may still be working" } else { '' }
+    $ap = Get-AutopilotState
+    if ($ready.Count) {
+        $fix = if ($ap.State -eq 'ok') { 'overclock reap -Kill   (autopilot ends the ones it knows on its next run)' } else { 'overclock reap -Kill, or let it happen automatically: overclock autopilot install' }
+        Add-Finding 'WARN' ('{0} orphaned process trees ({1}) from sessions that are gone{2}.' -f $ready.Count, (Format-MB (($ready | Measure-Object MB -Sum).Sum)), $later) $fix
+    }
+    if ($ap.State -ne 'ok' -and $ap.State -ne 'off') { Add-Finding 'HIGH' "Autopilot: $($ap.State)." 'overclock autopilot install   (something removed or stopped it)' }
+    elseif ($ap.State -eq 'off' -and $sessions.Count -ge 5) { Add-Finding 'INFO' 'Autopilot is off: orphans and new sessions are not handled automatically.' 'overclock autopilot install   (every 10 min: ends orphaned Claude trees, keeps Claude at below-normal priority)' }
 
     Write-Head '== Findings'
     if (-not $findings.Count) { Write-Good 'Nothing unusual found.' }
@@ -564,7 +586,8 @@ function Invoke-Leaks {
             Write-Warn2 "$($r.Name) is a known leak: $($r.Known.device), driver $($r.Known.driverVersions -join ', ')."
             Write-Host "   Fix: $($r.Known.fix)"
         }
-        if ($r.Service -and $r.Service -notmatch ',') { Write-Host "   Stop-gap: overclock watchdog install $($r.Name)   (restarts the service $($r.Service) above -Threshold handles)" }
+        if ($r.Kernel) { Write-Host '   This is the Windows kernel: a driver leaks handles into it. Update drivers (Bluetooth, network, GPU, RGB tools first). No watchdog possible.' }
+        elseif ($r.Service -and $r.Service -notmatch ',') { Write-Host "   Stop-gap: overclock watchdog install $($r.Name)   (restarts the service $($r.Service) above -Threshold handles)" }
         Write-Host "   Details: overclock handles $($r.Name)"
     }
     Write-Host ''
@@ -676,17 +699,21 @@ function Invoke-Orphans {
     $done = 0; $failed = 0
     foreach ($o in $killable) {
         if (-not (Confirm-Step ("End pid $($o.Root.Id) and its $($o.Count - 1) child processes?"))) { continue }
-        # taskkill writes to stderr when a child already exited; under PS 5.1 that must not abort the loop
-        $null = & cmd.exe /c "taskkill /PID $($o.Root.Id) /T /F >nul 2>&1"
-        $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($o.Root.Id)" -ErrorAction SilentlyContinue
-        if ($still -and $still.CreationDate -eq $o.Root.Created) {
-            Stop-Process -Id $o.Root.Id -Force -ErrorAction SilentlyContinue
-            $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($o.Root.Id)" -ErrorAction SilentlyContinue
-        }
-        if ($still -and $still.CreationDate -eq $o.Root.Created) { $failed++; Write-Warn2 "pid $($o.Root.Id) is still running." } else { $done++ }
+        if (Stop-OrphanTree $o) { $done++ } else { $failed++; Write-Warn2 "pid $($o.Root.Id) is still running." }
     }
     Write-Good "Ended $done tree(s)."
     if ($failed) { Write-Warn2 "$failed tree(s) could not be ended; run as administrator." }
+}
+function Stop-OrphanTree($o) {
+    # taskkill writes to stderr when a child already exited; under PS 5.1 that must not abort the caller
+    $null = & cmd.exe /c "taskkill /PID $($o.Root.Id) /T /F >nul 2>&1"
+    $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($o.Root.Id)" -ErrorAction SilentlyContinue
+    # the creation time check keeps us from touching a new process that reused the pid
+    if ($still -and $still.CreationDate -eq $o.Root.Created) {
+        Stop-Process -Id $o.Root.Id -Force -ErrorAction SilentlyContinue
+        $still = Get-CimInstance Win32_Process -Filter "ProcessId=$($o.Root.Id)" -ErrorAction SilentlyContinue
+    }
+    -not ($still -and $still.CreationDate -eq $o.Root.Created)
 }
 
 # ---------------------------------------------------------------- watchdog
@@ -992,21 +1019,28 @@ function Invoke-DiskRepair {
 }
 
 # ---------------------------------------------------------------- throttle
-function Invoke-Throttle {
-    $s = Get-Snap
-    $want = if ($Undo) { [Diagnostics.ProcessPriorityClass]::Normal } else { [Diagnostics.ProcessPriorityClass]::BelowNormal }
-    $from = if ($Undo) { [Diagnostics.ProcessPriorityClass]::BelowNormal } else { [Diagnostics.ProcessPriorityClass]::Normal }
-    $ids = New-Object System.Collections.Generic.HashSet[int]
-    foreach ($x in $s.List) { if ($x.Kind -eq 'cli' -or $x.Cli) { [void]$ids.Add($x.Id) } }
-    foreach ($o in Get-Orphans $s) { if (-not $o.Expected) { foreach ($t in $o.Tree) { [void]$ids.Add($t.Id) } } }
-    [void]$ids.Remove($PID)
+function Set-ClaudePriority($s, $ids, [bool]$undo) {
+    $want = if ($undo) { [Diagnostics.ProcessPriorityClass]::Normal } else { [Diagnostics.ProcessPriorityClass]::BelowNormal }
+    $from = if ($undo) { [Diagnostics.ProcessPriorityClass]::BelowNormal } else { [Diagnostics.ProcessPriorityClass]::Normal }
     $done = 0; $skipped = 0
     foreach ($id in $ids) {
+        if ($id -eq $PID) { continue }
         try {
             $p = Get-Process -Id $id -ErrorAction Stop
+            $x = $s.ById[$id]
+            if ($x -and [math]::Abs(($p.StartTime - $x.Created).TotalSeconds) -gt 1) { $skipped++; continue }
             if ($p.PriorityClass -eq $from) { $p.PriorityClass = $want; $done++ } else { $skipped++ }
         } catch { $skipped++ }
     }
+    @($done, $skipped)
+}
+function Invoke-Throttle {
+    $s = Get-Snap
+    $ids = New-Object System.Collections.Generic.HashSet[int]
+    foreach ($x in $s.List) { if ($x.Kind -eq 'cli' -or $x.Cli) { [void]$ids.Add($x.Id) } }
+    foreach ($o in Get-Orphans $s) { if (-not $o.Expected) { foreach ($t in $o.Tree) { [void]$ids.Add($t.Id) } } }
+    $r = Set-ClaudePriority $s $ids ([bool]$Undo)
+    $done = $r[0]; $skipped = $r[1]
     if ($Undo) { Write-Good "$done Claude processes are back at normal priority." }
     else {
         Write-Good "$done Claude processes now run below normal priority; your own apps come first."
@@ -1014,6 +1048,102 @@ function Invoke-Throttle {
         Write-Host 'New sessions start at normal priority: run "throttle" again after opening new ones. Undo with: throttle -Undo' -ForegroundColor DarkGray
     }
     if ($skipped) { Write-Host "$skipped processes left as they were (already changed, exited or protected)." -ForegroundColor DarkGray }
+}
+
+# ---------------------------------------------------------------- autopilot
+function Get-ProcKey($x) { "$($x.Id)|$($x.Created.ToString('yyyyMMddHHmmss'))" }
+function Get-AutopilotState {
+    $name = "autopilot-$env:USERNAME"
+    $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $name -ErrorAction SilentlyContinue
+    $beat = Join-Path $ApDir 'autopilot.last'
+    $last = $null; $info = ''
+    if (Test-Path $beat) { $last = (Get-Item $beat).LastWriteTime; $info = (Get-Content $beat -Raw).Trim() }
+    $every = 10
+    if ($t) { try { $iv = $t.Triggers[0].Repetition.Interval; if ($iv -match 'PT(\d+)M') { $every = [int]$matches[1] } } catch { } }
+    $installed = Test-Path (Join-Path $ApDir 'autopilot.vbs')
+    $state = if (-not $t -and -not $installed) { 'off' } elseif (-not $t) { 'TASK MISSING' } elseif (-not $last) { 'never ran' } elseif (((Get-Date) - $last).TotalMinutes -gt 3 * $every + 2) { 'STALE' } else { 'ok' }
+    [pscustomobject]@{ State = $state; Every = $every; LastRun = $last; Info = $info; Name = $name }
+}
+function Invoke-AutopilotRun {
+    New-Item -ItemType Directory -Force -Path $ApDir | Out-Null
+    $log = Join-Path $ApDir 'autopilot.log'; $knownFile = Join-Path $ApDir 'autopilot-known.json'
+    $minAge = if ($PSBoundParameters.ContainsKey('MinAgeMinutes') -or $script:MinAgeBound) { $MinAgeMinutes } else { 30 }
+    $s = Get-Snap
+    $known = New-Object System.Collections.Generic.HashSet[string]
+    if (Test-Path $knownFile) { try { foreach ($k in (Get-Content $knownFile -Raw | ConvertFrom-Json)) { [void]$known.Add([string]$k) } } catch { } }
+    $keep = New-Object System.Collections.Generic.HashSet[string]
+    $ids = New-Object System.Collections.Generic.HashSet[int]
+    foreach ($x in $s.List) { if ($x.Kind -eq 'cli' -or $x.Cli) { [void]$keep.Add((Get-ProcKey $x)); [void]$ids.Add($x.Id) } }
+    $reaped = New-Object System.Collections.Generic.List[string]
+    foreach ($o in Get-Orphans $s) {
+        if ($o.Expected) { continue }
+        # only trees this autopilot saw inside a Claude session before; your own detached servers are never touched
+        $fromClaude = @($o.Tree | Where-Object { $known.Contains((Get-ProcKey $_)) }).Count -gt 0
+        if (-not $fromClaude) { continue }
+        if (((Get-Date) - $o.Root.Created).TotalMinutes -lt $minAge) {
+            foreach ($t in $o.Tree) { [void]$keep.Add((Get-ProcKey $t)); [void]$ids.Add($t.Id) }
+            continue
+        }
+        $what = $o.Tree | Where-Object { $_.Name -notmatch '^(bash|sh|cmd|conhost)\.exe$' } | Select-Object -First 1
+        if (-not $what) { $what = $o.Root }
+        if (Stop-OrphanTree $o) { $reaped.Add(('ended pid {0} ({1} proc, {2}, age {3}): {4}' -f $o.Root.Id, $o.Count, (Format-MB $o.MB), (Format-Age $o.Root.Created), (Limit-Text (Hide-Paths "$($what.Name) $($what.Cmd -replace '^"?[^"]*\\', '')") 110))) }
+        else { foreach ($t in $o.Tree) { [void]$keep.Add((Get-ProcKey $t)) } }
+    }
+    $pr = Set-ClaudePriority $s $ids $false
+    @($keep) | ConvertTo-Json -Compress | Set-Content -Path $knownFile -Encoding UTF8
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    if ((Test-Path $log) -and (Get-Item $log).Length -gt 1MB) { Move-Item $log "$log.old" -Force }
+    foreach ($r in $reaped) { Add-Content -Path $log -Value "$stamp  $r" }
+    if ($pr[0]) { Add-Content -Path $log -Value "$stamp  lowered priority of $($pr[0]) Claude process(es)" }
+    $sess = @($s.List | Where-Object { $_.Role -eq 'session' }).Count
+    Set-Content -Path (Join-Path $ApDir 'autopilot.last') -Value ("{0}  sessions={1}  ended={2}  lowered={3}  watching={4}" -f $stamp, $sess, $reaped.Count, $pr[0], $keep.Count)
+}
+function Invoke-Autopilot {
+    switch ($Target) {
+        'run' { Invoke-AutopilotRun }
+        'install' {
+            $every = if ($PSBoundParameters.ContainsKey('Every') -or $script:EveryBound) { $Every } else { 10 }
+            $minAge = if ($script:MinAgeBound) { $MinAgeMinutes } else { 30 }
+            New-Item -ItemType Directory -Force -Path $ApDir | Out-Null
+            Copy-Item -LiteralPath (Join-Path $ScriptDir 'overclock.ps1') -Destination $ApDir -Force
+            $ki = Join-Path $ScriptDir 'known-issues.json'; if (Test-Path $ki) { Copy-Item -LiteralPath $ki -Destination $ApDir -Force }
+            $ps = Join-Path $ApDir 'overclock.ps1'
+            # wscript keeps the run invisible; a hidden PowerShell window would still flash every few minutes
+            $vbs = Join-Path $ApDir 'autopilot.vbs'
+            ('CreateObject("WScript.Shell").Run "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{0}"" autopilot run -MinAgeMinutes {1}", 0, True' -f $ps, $minAge) | Set-Content -Path $vbs -Encoding ASCII
+            $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`""
+            $t1 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes $every)
+            $t2 = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+            $lvl = if (Test-Admin) { 'Highest' } else { 'Limited' }
+            $pr = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel $lvl
+            $st = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+            $name = "autopilot-$env:USERNAME"
+            Register-ScheduledTask -TaskPath $TaskPath -TaskName $name -Action $action -Trigger $t1, $t2 -Principal $pr -Settings $st -Description "claude-overclock autopilot: every $every min ends orphaned Claude process trees older than $minAge min and keeps Claude at below-normal priority." -Force | Out-Null
+            $beat = Join-Path $ApDir 'autopilot.last'
+            if (Test-Path $beat) { Remove-Item $beat -Force }
+            Start-ScheduledTask -TaskPath $TaskPath -TaskName $name
+            for ($i = 0; $i -lt 90 -and -not (Test-Path $beat); $i++) { Start-Sleep -Seconds 1 }
+            Write-Good "Autopilot installed: every $every min it ends orphaned Claude trees older than $minAge min and keeps Claude sessions at below-normal priority."
+            Write-Host '   It only ends processes it saw inside a Claude session before, never your own programs.'
+            if (Test-Path $beat) { Write-Host ('   first run: ' + (Get-Content $beat -Raw).Trim()) } else { Write-Warn2 '   The first run has not reported back yet; check "autopilot status" in a minute.' }
+            Write-Host '   status: overclock autopilot status    off: overclock autopilot remove' -ForegroundColor DarkGray
+        }
+        'remove' {
+            $name = "autopilot-$env:USERNAME"
+            Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+            if (Test-Path $ApDir) { Remove-Item $ApDir -Recurse -Force -ErrorAction SilentlyContinue }
+            Write-Good 'Autopilot removed. Priorities already lowered stay until those processes end (or run throttle -Undo).'
+        }
+        default {
+            $a = Get-AutopilotState
+            $c = switch ($a.State) { 'ok' { 'Green' } 'off' { 'Gray' } default { 'Red' } }
+            Write-Host ('Autopilot: {0}   every {1} min   last run: {2}' -f $a.State, $a.Every, $a.Info) -ForegroundColor $c
+            $log = Join-Path $ApDir 'autopilot.log'
+            if (Test-Path $log) { Get-Content $log -Tail 8 | ForEach-Object { Write-Host "   $_" -ForegroundColor DarkGray } }
+            if ($a.State -eq 'off') { Write-Host 'Turn it on with: overclock autopilot install' }
+            if ($a.State -eq 'TASK MISSING') { Write-Warn2 'The scheduled task is gone but its files are still here. Something deleted it; reinstall with "autopilot install".' }
+        }
+    }
 }
 
 # ---------------------------------------------------------------- report
@@ -1067,6 +1197,7 @@ switch ($Command) {
     'reap' { Invoke-Orphans }
     'disk' { Invoke-Disk }
     'throttle' { Invoke-Throttle }
+    'autopilot' { Invoke-Autopilot }
     'watchdog' { Invoke-Watchdog }
     'report' { Invoke-Report }
     'help' { Get-Help $MyInvocation.MyCommand.Path -Detailed }

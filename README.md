@@ -20,6 +20,8 @@ A Claude Code plugin with slash commands, and a single PowerShell file you can a
 
 Then ask Claude "why is my PC so slow?" or use the commands directly: `/overclock:check`, `/overclock:disk`, `/overclock:throttle`, ...
 
+**Let it run on its own:** `/overclock:autopilot install`. Every 10 minutes it ends orphaned Claude process trees and keeps Claude sessions at below-normal priority, so your PC stays usable while agents work. No admin needed, every action is logged, `/overclock:autopilot remove` turns it off.
+
 **Standalone:** download `overclock.ps1` and `known-issues.json` (or clone the repo) and run in PowerShell:
 
 ```powershell
@@ -36,7 +38,8 @@ Run it as administrator for everything; `check`, `disk`, `sessions`, `agents`, `
 | `/overclock:disk` | `disk` | SSD model, health, temperature, DRAM cache, file system errors, TRIM, maintenance, page file, I/O by session, **what fills the disk** (Docker, Go/npm caches, worktrees, transcripts) | no |
 | `/overclock:fix` | `disk repair` | schedules the file system repair, turns maintenance back on, rebuilds broken performance counters, runs TRIM (only on a clean file system). `-DryRun` shows the plan | yes, asks per step (admin) |
 | `/overclock:throttle` | `throttle` | every Claude session and everything it started runs at **below-normal priority**: your apps come first, agents keep working on the spare CPU. `-Undo` reverts | priority only |
-| `/overclock:reap` | `reap` / `orphans` | dev servers, test runs and headless browsers whose session is gone. `-Kill` ends them (skips anything younger than 10 min) | with `-Kill` |
+| `/overclock:autopilot` | `autopilot install\|status\|remove` | scheduled task for your user: every 10 min ends orphaned trees older than 30 min **that it saw inside a Claude session before** and keeps Claude at below-normal priority | yes (no admin) |
+| `/overclock:reap` | `reap` / `orphans` | dev servers, test runs and headless browsers whose session is gone. `-Kill` ends them (skips anything younger than 10 min); the slash command does this right away | with `-Kill` |
 | `/overclock:sessions` | `sessions` | every session: model, project, processes, memory, MCP servers, dev servers with ports, tests, browsers, agents started by your own code | no |
 | `/overclock:agents` | `agents -Hours 24` | subagents and workflows per hour from the session logs, peak concurrency, who spawned them | no |
 | `/overclock:leaks` | `leaks` | 60-second handle sample, every process whose handles keep growing, with its service | no |
@@ -122,7 +125,7 @@ Trees whose session or shell is gone: duplicated `npm run dev` servers from hour
 ## What to do, in order
 
 1. `/overclock:check` - read the findings.
-2. `/overclock:throttle` - your PC is usable again right away, nothing is stopped.
+2. `/overclock:throttle` - your PC is usable again right away, nothing is stopped. `/overclock:autopilot install` keeps it that way.
 3. **Run fewer sessions and agents at once.** Archive sessions you don't use: the desktop app resumes all of them after a restart. Cap parallel agents in workflows (3-4).
 4. `/overclock:fix` - repair the file system, maintenance, counters; after the restart run it again for TRIM.
 5. `/overclock:reap` - end leftover dev servers and test runs.
@@ -134,7 +137,9 @@ Trees whose session or shell is gone: duplicated `npm run dev` servers from hour
 
 - Read-only: `check`, `disk`, `sessions`, `agents`, `leaks`, `handles`, `spawns`, `reap`, `watchdog status`, `report`, `disk repair -DryRun`.
 - `throttle` only changes process priority and is undone with `-Undo`.
-- `reap -Kill` asks per tree and never touches trees younger than `-MinAgeMinutes` (default 10) or background services.
+- `reap -Kill` never touches trees younger than `-MinAgeMinutes` (default 10) or background services. In a terminal it asks per tree; `/overclock:reap` runs it right away.
+- `autopilot` only ends a tree if it saw one of its processes inside a Claude session on an earlier run. A server you started yourself and detached is never touched, even when its parent is gone (tested). It runs invisibly through `wscript`, logs every action to `%LOCALAPPDATA%\claude-overclock\autopilot.log`, and `check` reports it as `STALE` or `TASK MISSING` if it stops.
+- The `System` process and other kernel processes never get a watchdog recommendation.
 - `disk repair` asks before every step, never runs TRIM on a damaged file system, and the file system repair itself runs at the next restart.
 - `watchdog install` refuses a process that hosts several services (like `svchost`).
 - The slash commands tell Claude to show what will change and wait for your yes before anything that changes your system. Claude never stops or archives your sessions on its own.
