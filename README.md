@@ -92,7 +92,9 @@ Page file: 8,578 MB in use (peak 13,476 MB since boot)
 
 **Without a restart:** `/overclock:throttle` also puts every Claude process, including plugin databases like claude-mem's vector store (here 21 MB/s of reads), at **background disk priority**, so Windows serves your own reads and writes first. On my PC the disk traffic dropped from about 75 to 26 MB/s.
 
-**Fix:** `/overclock:fix` schedules `chkdsk /spotfix` (about a minute at the next restart), turns maintenance back on and rebuilds the counters. **TRIM runs only after the file system is repaired**: TRIM on a damaged file system can release blocks that are still in use.
+- The same tuning tool had switched off **Windows memory compression** (`Get-MMAgent`: `MemoryCompression False`, `SysMain` disabled). Normally Windows compresses memory it has no room for and keeps it in RAM; without it every page goes straight to the page file on the SSD. That is why full RAM turned into 100 % disk so fast here.
+
+**Fix:** `/overclock:fix` schedules `chkdsk /spotfix` (about a minute at the next restart), turns memory compression and maintenance back on and the performance counters. **TRIM runs only after the file system is repaired**: TRIM on a damaged file system can release blocks that are still in use.
 
 ### 3. A Bluetooth driver leaking Event handles (the 2 million handles)
 

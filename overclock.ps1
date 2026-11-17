@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
 $EveryBound = $PSBoundParameters.ContainsKey('Every')
-$Version = '0.3.3'
+$Version = '0.3.4'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -385,6 +385,10 @@ function Invoke-Check([int]$sec) {
     Write-Host ('RAM {0}% used ({1} free of {2})   commit {3}%   up {4}' -f $ramPct, (Format-MB $ramFree), (Format-MB $ramTotal), $commitPct, (Format-Age $os.LastBootUpTime))
     Write-Host ('{0:N0} processes   {1:N0} threads   {2:N0} handles' -f $s.List.Count, $threads, $handles)
     if ($ramPct -ge 90) { Add-Finding 'HIGH' "RAM is $ramPct % full." 'See "Who holds the RAM" above.' } elseif ($ramPct -ge 80) { Add-Finding 'WARN' "RAM is $ramPct % full." 'See "Who holds the RAM" above.' }
+    $mm = Get-MemoryManagerState
+    if ($mm -and (-not $mm.Compression -or $mm.SysMain -ne 'Running')) {
+        Add-Finding 'HIGH' ("Windows memory compression is off (MemoryCompression={0}, SysMain service {1}/{2}): when RAM is full, every page goes straight to the page file on the SSD instead of being compressed in RAM. Usually switched off by a tuning tool." -f $mm.Compression, $mm.SysMain, $mm.SysMainStart) 'overclock disk repair   (admin; turns it back on, active after a restart)'
+    }
     if ($commitPct -ge 90) { Add-Finding 'HIGH' "Commit charge is at $commitPct % - Windows is about to run out of memory." 'Close sessions or programs now.' }
     if ($handles -ge 1000000) { Add-Finding 'HIGH' ('{0:N0} handles in total (normal: 100-300k).' -f $handles) 'overclock leaks' } elseif ($handles -ge 400000) { Add-Finding 'WARN' ('{0:N0} handles in total (normal: 100-300k).' -f $handles) 'overclock leaks' }
 
@@ -1017,6 +1021,14 @@ function Invoke-Disk {
         }
     }
 }
+function Get-MemoryManagerState {
+    $svc = Get-Service SysMain -ErrorAction SilentlyContinue
+    $mm = $null; try { $mm = Get-MMAgent -ErrorAction Stop } catch { }
+    if (-not $mm) { return $null }   # needs admin
+    [pscustomobject]@{ Compression = [bool]$mm.MemoryCompression; PageCombining = [bool]$mm.PageCombining
+        SysMain = if ($svc) { [string]$svc.Status } else { 'missing' }; SysMainStart = if ($svc) { [string]$svc.StartType } else { '' }
+        Running = [bool](Get-Process -Name 'Memory Compression' -ErrorAction SilentlyContinue) }
+}
 function Invoke-DiskRepair {
     if (-not $DryRun) { Assert-Admin }
     $f = Get-DiskFacts
@@ -1034,6 +1046,14 @@ function Invoke-DiskRepair {
             $o = (& cmd.exe /c "echo Y| chkdsk $($v.Letter): /spotfix" 2>&1) -join "`n"
             Write-Host ($o -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 3 | Out-String).Trim()
             Write-Warn2 '   Restart Windows to run it. Archive Claude sessions you do not need first: the desktop app resumes all of them.'
+        }
+    }
+    $mm = Get-MemoryManagerState
+    if ($mm -and ($mm.SysMain -ne 'Running' -or -not $mm.Compression -or -not $mm.PageCombining)) {
+        Step 'Turn memory compression back on (SysMain service, memory compression, page combining; active after the next restart)' {
+            Set-Service SysMain -StartupType Automatic; Start-Service SysMain -ErrorAction SilentlyContinue
+            Enable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue; Enable-MMAgent -PageCombining -ErrorAction SilentlyContinue
+            Write-Good '   Memory compression is on. Windows now compresses memory instead of writing it to the page file (after a restart).'
         }
     }
     if ($f.MaintenanceDisabled) {
