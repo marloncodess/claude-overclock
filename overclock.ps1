@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
 $EveryBound = $PSBoundParameters.ContainsKey('Every')
-$Version = '0.3.1'
+$Version = '0.3.2'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -181,6 +181,8 @@ function Get-KnownIssues {
 
 $KernelNames = @('System', 'Idle', 'Registry', 'Memory Compression', 'Secure System', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass')
 $ApDir = Join-Path $env:LOCALAPPDATA 'claude-overclock'
+# language servers that LSP plugins start once per session; Claude Code starts them again when it needs them
+$LspPattern = 'typescript-language-server|pyright-langserver|basedpyright-langserver|[\\/ "]gopls(\.exe)?[" ]|rust-analyzer|vscode-[\w-]+-language-server|intelephense|jdtls|clangd'
 $ShellNames = @('bash.exe', 'sh.exe', 'zsh.exe', 'powershell.exe', 'pwsh.exe', 'cmd.exe', 'conhost.exe', 'OpenConsole.exe')
 $WatchNames = @('node.exe', 'bun.exe', 'deno.exe', 'bash.exe', 'sh.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'python.exe', 'python3.exe', 'py.exe', 'uv.exe', 'uvx.exe', 'go.exe', 'esbuild.exe', 'chrome-headless-shell.exe', 'chrome.exe', 'msedge.exe', 'java.exe', 'cargo.exe', 'ruby.exe', 'dotnet.exe', 'docker.exe')
 
@@ -266,6 +268,7 @@ function Get-Role($s, $x) {
     if ($n -match '\.test\.exe$' -or $c -match 'vitest|jest|pytest|mocha|playwright test|go(\.exe)?"? test|cargo test|bun test') { return 'test' }
     if ($n -eq 'chrome-headless-shell.exe' -or ($n -match '^(chrome|msedge)\.exe$' -and $c -match '--headless|--remote-debugging')) { return 'browser' }
     if ($c -match 'vite|next(\.js)? dev|next-server|webpack(-dev-server)? |astro dev|nodemon|tsx(\.cmd)?"? watch|run dev|run start|dev:|serve\b|uvicorn|flask run|http\.server') { return 'dev-server' }
+    if ($c -match $LspPattern) { return 'lsp' }
     if ($ShellNames -contains $x.Name) { return 'shell' }
     $p = Get-ValidParent $s $x
     if ($p -and ($p.Id -eq $x.Cli -or ($p.Name -eq 'cmd.exe' -and $p.PPid -eq $x.Cli))) { return 'mcp' }
@@ -468,6 +471,15 @@ function Invoke-Check([int]$sec) {
     foreach ($g in $mcpGroups) {
         if ($g.Count -ge 5 -and $g.Count -ge [math]::Max(1, $sessions.Count) - 1) {
             Add-Finding 'WARN' ('MCP server "{0}" runs {1} times (once per session).' -f $g.Name, $g.Count) 'If you need it only in some projects, move it from your user config to those projects'' .mcp.json.'
+        }
+    }
+    $lsps = @(Get-LspTrees $s)
+    if ($lsps.Count) {
+        $lspMB = ($lsps | Measure-Object MB -Sum).Sum
+        foreach ($g in $lsps | Group-Object Name) { Write-Host ('  LSP {0,-28} x{1,-3} {2}' -f $g.Name, $g.Count, (Format-MB (($g.Group | Measure-Object MB -Sum).Sum))) }
+        if ($lspMB -ge 3000) {
+            $fix = if ((Get-AutopilotState).State -eq 'ok') { 'Autopilot ends the ones idle for 30 min (Claude Code starts them again when needed). Not needed at all? claude plugin disable <name>-lsp' } else { 'overclock autopilot install   (ends idle ones; Claude Code starts them again when needed), or: claude plugin disable <name>-lsp' }
+            Add-Finding $(if ($lspMB -ge 8000) { 'HIGH' } else { 'WARN' }) ('{0} language servers from LSP plugins hold {1} (one per session). With too little RAM Windows moves this to the page file: disk at 100 %.' -f $lsps.Count, (Format-MB $lspMB)) $fix
         }
     }
     if ($act.Peak -ge 8) { Add-Finding 'HIGH' "Up to $($act.Peak) agents ran at the same time in the last hour (workflows/subagents)." 'overclock agents   - each agent runs its own builds and tests; cap parallel agents in your workflow.' }
@@ -720,6 +732,17 @@ function Invoke-Orphans {
     }
     Write-Good "Ended $done tree(s)."
     if ($failed) { Write-Warn2 "$failed tree(s) could not be ended; run as administrator." }
+}
+function Get-LspTrees($s) {
+    foreach ($x in $s.List) {
+        if (-not $x.Cli -or $x.Cmd -notmatch $LspPattern) { continue }
+        $p = Get-ValidParent $s $x
+        if ($p -and $p.Cmd -match $LspPattern) { continue }   # only the top of each language server tree (often a cmd.exe shim)
+        $tree = @(Get-Tree $s $x)
+        $name = if ($x.Cmd -match '(typescript-language-server|pyright-langserver|basedpyright-langserver|gopls|rust-analyzer|vscode-[\w-]+-language-server|intelephense|jdtls|clangd)') { $matches[1] } else { $x.Name }
+        [pscustomobject]@{ Root = $x; Tree = $tree; Count = $tree.Count; Name = $name; Cli = $x.Cli
+            MB = ($tree | Measure-Object PrivMB -Sum).Sum; Cpu = ($tree | Measure-Object Cpu -Sum).Sum }
+    }
 }
 function Stop-OrphanTree($o) {
     # taskkill writes to stderr when a child already exited; under PS 5.1 that must not abort the caller
@@ -1109,6 +1132,20 @@ function Invoke-AutopilotRun {
         if (Stop-OrphanTree $o) { $reaped.Add(('ended pid {0} ({1} proc, {2}, age {3}): {4}' -f $o.Root.Id, $o.Count, (Format-MB $o.MB), (Format-Age $o.Root.Created), (Limit-Text (Hide-Paths "$($what.Name) $($what.Cmd -replace '^"?[^"]*\\', '')") 110))) }
         else { foreach ($t in $o.Tree) { [void]$keep.Add((Get-ProcKey $t)) } }
     }
+    # language servers that did nothing since the last run and are older than minAge: end them, Claude Code restarts them on demand
+    $lspFile = Join-Path $ApDir 'autopilot-lsp.json'
+    $lspPrev = @{}
+    if (Test-Path $lspFile) { try { (Get-Content $lspFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $lspPrev[$_.Name] = [double]$_.Value } } catch { } }
+    $lspNow = @{}
+    foreach ($l in Get-LspTrees $s) {
+        $k = Get-ProcKey $l.Root
+        $idle = $lspPrev.ContainsKey($k) -and ($l.Cpu - $lspPrev[$k]) -lt 1
+        if ($idle -and ((Get-Date) - $l.Root.Created).TotalMinutes -ge $minAge -and $l.MB -ge 200 -and (Stop-OrphanTree $l)) {
+            $reaped.Add(('ended idle language server {0} (pid {1}, {2}, session pid {3}); Claude Code starts it again when needed' -f $l.Name, $l.Root.Id, (Format-MB $l.MB), $l.Cli))
+            foreach ($t in $l.Tree) { [void]$ids.Remove($t.Id) }
+        } else { $lspNow[$k] = $l.Cpu }
+    }
+    $lspNow | ConvertTo-Json -Compress | Set-Content -Path $lspFile -Encoding UTF8
     $pr = Set-ClaudePriority $s $ids $false
     @($keep) | ConvertTo-Json -Compress | Set-Content -Path $knownFile -Encoding UTF8
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'

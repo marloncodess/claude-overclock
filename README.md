@@ -20,7 +20,7 @@ A Claude Code plugin with slash commands, and a single PowerShell file you can a
 
 Then ask Claude "why is my PC so slow?" or use the commands directly: `/overclock:check`, `/overclock:disk`, `/overclock:throttle`, ...
 
-**Let it run on its own:** `/overclock:autopilot install`. Every 10 minutes it ends orphaned Claude process trees and keeps Claude sessions at below-normal priority, so your PC stays usable while agents work. No admin needed, every action is logged, `/overclock:autopilot remove` turns it off.
+**Let it run on its own:** `/overclock:autopilot install`. Every 10 minutes it ends orphaned Claude process trees and idle language servers and keeps Claude sessions at below-normal priority, so your PC stays usable while agents work. No admin needed, every action is logged, `/overclock:autopilot remove` turns it off.
 
 **Standalone:** download `overclock.ps1` and `known-issues.json` (or clone the repo) and run in PowerShell:
 
@@ -34,11 +34,11 @@ Run it as administrator for everything; `check`, `disk`, `sessions`, `agents`, `
 
 | Slash command | PowerShell | What it does | Changes anything? |
 |---|---|---|---|
-| `/overclock:check` | `check` | 20-second health check: CPU, RAM, disk I/O and handles **by owner** (each Claude session with everything it started), sessions, MCP copies, agents, orphans, leaks, disk errors | no |
+| `/overclock:check` | `check` | 20-second health check: CPU, RAM, disk I/O and handles **by owner** (each Claude session with everything it started), sessions, MCP copies, language servers, agents, orphans, leaks, disk errors | no |
 | `/overclock:disk` | `disk` | SSD model, health, temperature, DRAM cache, file system errors, TRIM, maintenance, page file, I/O by session, **what fills the disk** (Docker, Go/npm caches, worktrees, transcripts) | no |
 | `/overclock:fix` | `disk repair` | schedules the file system repair, turns maintenance back on, rebuilds broken performance counters, runs TRIM (only on a clean file system). `-DryRun` shows the plan | yes, asks per step (admin) |
 | `/overclock:throttle` | `throttle` | every Claude session and everything it started runs at **below-normal CPU priority and background disk priority**: your apps come first, agents keep working on the spare CPU and disk time. `-Undo` reverts | priority only |
-| `/overclock:autopilot` | `autopilot install\|status\|remove` | scheduled task for your user: every 10 min ends orphaned trees older than 30 min **that it saw inside a Claude session before** and keeps Claude at below-normal CPU and background disk priority | yes (no admin) |
+| `/overclock:autopilot` | `autopilot install\|status\|remove` | scheduled task for your user: every 10 min ends orphaned trees older than 30 min **that it saw inside a Claude session before** ends language servers idle for 30 min (Claude Code starts them again when needed) and keeps Claude at below-normal CPU and background disk priority | yes (no admin) |
 | `/overclock:reap` | `reap` / `orphans` | dev servers, test runs and headless browsers whose session is gone. `-Kill` ends them (skips anything younger than 10 min); the slash command does this right away | with `-Kill` |
 | `/overclock:sessions` | `sessions` | every session: model, project, processes, memory, MCP servers, dev servers with ports, tests, browsers, agents started by your own code | no |
 | `/overclock:agents` | `agents -Hours 24` | subagents and workflows per hour from the session logs, peak concurrency, who spawned them | no |
@@ -124,6 +124,18 @@ User-level MCP servers start **once per session**: 20 sessions x 3 servers = 60 
 
 Trees whose session or shell is gone: duplicated `npm run dev` servers from hours ago, hanging `vitest`, a Go fuzzer, 4 headless Chromes. `reap -Kill` freed 60 processes and 26,000 handles the first time; a day later there were 7 GB of them again. Claude Code's own timeouts and `TaskStop` clean up correctly (tested); where these come from is still open. Found out? Please open an issue.
 
+### 8. A TypeScript language server in every session (disk at 100 % from paging)
+
+Three days later the disk was at 100 % again: 46 MB/s read, **160 MB/s written**. All processes together wrote only 10 MB/s. The rest was Windows itself writing to the page file: **75.7 GB of memory were committed on a PC with 31 GB of RAM**, 29 GB of it in `pagefile.sys`.
+
+```
+LSP typescript-language-server   x10   14.1 GB
+```
+
+The `typescript-lsp` plugin starts `typescript-language-server` once **per session**, and each one runs two `tsserver` processes with the whole project loaded: about 1.4 GB each, also in sessions that never touched TypeScript again. Ending them is safe: Claude Code starts a language server again the next time it needs one (tested). That freed 11.8 GB, together with the orphans the page file went from 29 to 16 GB and RAM from 88 to 71 %.
+
+**Fix:** the autopilot ends language servers that were idle for 30 minutes. Don't need them? `claude plugin disable typescript-lsp@claude-plugins-official`.
+
 ## What to do, in order
 
 1. `/overclock:check` - read the findings.
@@ -131,7 +143,7 @@ Trees whose session or shell is gone: duplicated `npm run dev` servers from hour
 3. **Run fewer sessions and agents at once.** Archive sessions you don't use: the desktop app resumes all of them after a restart. Cap parallel agents in workflows (3-4).
 4. `/overclock:fix` - repair the file system, maintenance, counters; after the restart run it again for TRIM.
 5. `/overclock:reap` - end leftover dev servers and test runs.
-6. Move MCP servers you need only in some projects into those projects' `.mcp.json`. Check hooks in `~/.claude/settings.json` and plugins.
+6. Move MCP servers you need only in some projects into those projects' `.mcp.json`. Check hooks in `~/.claude/settings.json` and plugins. Disable LSP plugins you don't need: they start a language server per session.
 7. `/overclock:leaks` - a leaking driver needs an update; `watchdog install` bridges the time.
 8. Cap WSL/Docker memory with `memory=8GB` in `%UserProfile%\.wslconfig`. Give the SSD a heatsink if `disk` shows 70 °C+.
 
@@ -140,7 +152,7 @@ Trees whose session or shell is gone: duplicated `npm run dev` servers from hour
 - Read-only: `check`, `disk`, `sessions`, `agents`, `leaks`, `handles`, `spawns`, `reap`, `watchdog status`, `report`, `disk repair -DryRun`.
 - `throttle` only changes CPU and disk (I/O) priority and is undone with `-Undo`.
 - `reap -Kill` never touches trees younger than `-MinAgeMinutes` (default 10) or background services. In a terminal it asks per tree; `/overclock:reap` runs it right away.
-- `autopilot` only ends a tree if it saw one of its processes inside a Claude session on an earlier run. A server you started yourself and detached is never touched, even when its parent is gone (tested). It runs invisibly through `wscript`, logs every action to `%LOCALAPPDATA%\claude-overclock\autopilot.log`, and `check` reports it as `STALE` or `TASK MISSING` if it stops.
+- `autopilot` only ends a tree if it saw one of its processes inside a Claude session on an earlier run. Language servers it ends only when they used no CPU for a whole run and are older than 30 min. A server you started yourself and detached is never touched, even when its parent is gone (tested). It runs invisibly through `wscript`, logs every action to `%LOCALAPPDATA%\claude-overclock\autopilot.log`, and `check` reports it as `STALE` or `TASK MISSING` if it stops.
 - The `System` process and other kernel processes never get a watchdog recommendation.
 - `disk repair` asks before every step, never runs TRIM on a damaged file system, and the file system repair itself runs at the next restart.
 - `watchdog install` refuses a process that hosts several services (like `svchost`).
