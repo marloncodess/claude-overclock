@@ -45,6 +45,7 @@ param(
     [int]$Seconds = 0,
     [int]$Hours = 24,
     [int]$Threshold = 100000,
+    [int]$FreeThreads = -1,
     [int]$Every = 5,
     [int]$MinAgeMinutes = 10,
     [string]$Service = '',
@@ -57,7 +58,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
 $EveryBound = $PSBoundParameters.ContainsKey('Every')
-$Version = '0.3.4'
+$Version = '0.3.5'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -184,7 +185,7 @@ $ApDir = Join-Path $env:LOCALAPPDATA 'claude-overclock'
 # language servers that LSP plugins start once per session; Claude Code starts them again when it needs them
 $LspPattern = 'typescript-language-server|pyright-langserver|basedpyright-langserver|[\\/ "]gopls(\.exe)?[" ]|rust-analyzer|vscode-[\w-]+-language-server|intelephense|jdtls|clangd'
 $ShellNames = @('bash.exe', 'sh.exe', 'zsh.exe', 'powershell.exe', 'pwsh.exe', 'cmd.exe', 'conhost.exe', 'OpenConsole.exe')
-$WatchNames = @('node.exe', 'bun.exe', 'deno.exe', 'bash.exe', 'sh.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'python.exe', 'python3.exe', 'py.exe', 'uv.exe', 'uvx.exe', 'go.exe', 'esbuild.exe', 'chrome-headless-shell.exe', 'chrome.exe', 'msedge.exe', 'java.exe', 'cargo.exe', 'ruby.exe', 'dotnet.exe', 'docker.exe')
+$WatchNames = @('nice.exe', 'node.exe', 'bun.exe', 'deno.exe', 'bash.exe', 'sh.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'python.exe', 'python3.exe', 'py.exe', 'uv.exe', 'uvx.exe', 'go.exe', 'esbuild.exe', 'chrome-headless-shell.exe', 'chrome.exe', 'msedge.exe', 'java.exe', 'cargo.exe', 'ruby.exe', 'dotnet.exe', 'docker.exe')
 
 # ---------------------------------------------------------------- process snapshot and classification
 function Get-Snap {
@@ -1097,7 +1098,14 @@ function Set-ClaudePriority($s, $ids, [bool]$undo) {
     $from = if ($undo) { [Diagnostics.ProcessPriorityClass]::BelowNormal } else { [Diagnostics.ProcessPriorityClass]::Normal }
     # disk: background I/O priority (1), so your own reads and writes are served first; undo sets it back to normal (2)
     $ioWant = if ($undo) { 2 } else { 1 }; $ioFrom = if ($undo) { 1 } else { 2 }
-    $done = 0; $skipped = 0; $io = 0
+    # CPU: keep some hardware threads free for you (default a quarter, at least 2); child processes inherit the affinity
+    $n = [math]::Min($Cores, 64)
+    $full = if ($n -ge 64) { -1L } else { (1L -shl $n) - 1 }
+    $free = if ($FreeThreads -ge 0) { $FreeThreads } else { [math]::Max(2, [math]::Floor($n / 4)) }
+    $free = [math]::Min($free, $n - 1)
+    $limited = if ($free -le 0) { $full } else { (1L -shl ($n - $free)) - 1 }
+    $affWant = if ($undo) { $full } else { $limited }
+    $done = 0; $skipped = 0; $io = 0; $script:AffinityDone = 0
     foreach ($id in $ids) {
         if ($id -eq $PID) { continue }
         try {
@@ -1106,6 +1114,7 @@ function Set-ClaudePriority($s, $ids, [bool]$undo) {
             if ($x -and [math]::Abs(($p.StartTime - $x.Created).TotalSeconds) -gt 1) { $skipped++; continue }
             if ($p.PriorityClass -eq $from) { $p.PriorityClass = $want; $done++ } else { $skipped++ }
             if ([Overclock.Native]::SetIoPriority($id, $ioWant, $ioFrom) -eq $ioFrom) { $io++ }
+            try { if ([long]$p.ProcessorAffinity -ne $affWant -and ($undo -or [long]$p.ProcessorAffinity -eq $full)) { $p.ProcessorAffinity = [IntPtr]$affWant; $script:AffinityDone++ } } catch { }
         } catch { $skipped++ }
     }
     @($done, $skipped, $io)
@@ -1119,7 +1128,7 @@ function Invoke-Throttle {
     $done = $r[0]; $skipped = $r[1]; $io = $r[2]
     if ($Undo) { Write-Good "$done Claude processes are back at normal CPU priority, $io at normal disk priority." }
     else {
-        Write-Good "$done Claude processes now run below normal CPU priority, $io at background disk priority; your own apps come first."
+        Write-Good "$done Claude processes now run below normal CPU priority, $io at background disk priority, $($script:AffinityDone) limited to part of the CPU threads; your own apps come first."
         Write-Host 'Builds, tests and agents keep running and use the CPU you are not using. Processes they start inherit the lower priority.' -ForegroundColor DarkGray
         Write-Host 'New sessions start at normal priority: run "throttle" again after opening new ones. Undo with: throttle -Undo' -ForegroundColor DarkGray
     }
