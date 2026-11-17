@@ -88,7 +88,7 @@ Page file: 8,578 MB in use (peak 13,476 MB since boot)
 - **C: has file system errors since 8 Nov**: NTFS asked for a scan at every boot (11 times), the dirty bit is set. It started the night C: was shrunk to make room for a Linux dual boot.
 - Nothing ever repaired it, because **Windows automatic maintenance was switched off**. That also means **no TRIM in 120 days**, which makes an SSD slower and slower.
 - The online scan (`chkdsk /scan`) could not even run: **there is no shadow copy storage** on any drive.
-- **Windows performance counters were broken**, so no monitoring tool except Task Manager could see the disk load.
+- **Windows performance counters were switched off**: a tuning tool had set `Perflib\Disable Performance Counters = 1`, which turns off all of them at once, so no monitoring tool except Task Manager could see the disk load.
 
 **Without a restart:** `/overclock:throttle` also puts every Claude process, including plugin databases like claude-mem's vector store (here 21 MB/s of reads), at **background disk priority**, so Windows serves your own reads and writes first. On my PC the disk traffic dropped from about 75 to 26 MB/s.
 

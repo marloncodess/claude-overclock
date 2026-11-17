@@ -57,7 +57,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
 $EveryBound = $PSBoundParameters.ContainsKey('Every')
-$Version = '0.3.2'
+$Version = '0.3.3'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -906,7 +906,11 @@ function Get-DiskFindings($f) {
     }
     if ($f.TrimEnabled -eq $false) { Add-F 'WARN' 'TRIM is switched off for NTFS (DisableDeleteNotify = 1).' 'fsutil behavior set DisableDeleteNotify 0   (admin)' }
     if ($f.MaintenanceDisabled) { Add-F 'HIGH' 'Windows automatic maintenance is switched off: no file system scans, no TRIM, no cleanup ever run.' 'overclock disk repair   (turns it back on)' }
-    if (-not $f.PerfCounters) { Add-F 'WARN' 'Windows performance counters for disk and memory are broken: only Task Manager can see disk load, monitoring tools see nothing.' 'overclock disk repair   (rebuilds them with lodctr /R)' }
+    if (-not $f.PerfCounters) {
+        $off = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib' -ErrorAction SilentlyContinue).'Disable Performance Counters'
+        $why = if ($off) { 'switched off: the registry value Perflib\"Disable Performance Counters" = 1 (set by a tuning tool) disables all of them' } else { 'broken' }
+        Add-F 'WARN' "Windows performance counters are $($why): only Task Manager can see disk load, monitoring tools see nothing." 'overclock disk repair   (admin; turns them back on, no restart needed)'
+    }
     if ($f.ShadowStorage -eq $false) { Add-F 'INFO' 'No shadow copy storage on any drive: online disk scans (chkdsk /scan) and restore points cannot run.' 'Turn on System Protection for C: (System Properties > System Protection), 5-10 % is enough.' }
     $res
 }
@@ -1039,9 +1043,18 @@ function Invoke-DiskRepair {
         }
     }
     if (-not $f.PerfCounters) {
-        Step 'Rebuild the Windows performance counters (lodctr /R, winmgmt /resyncperf)' {
-            & "$env:WINDIR\System32\lodctr.exe" /R | Out-Null
-            if (Test-Path "$env:WINDIR\SysWOW64\lodctr.exe") { & "$env:WINDIR\SysWOW64\lodctr.exe" /R | Out-Null }
+        Step 'Turn the Windows performance counters back on (Perflib switch, lodctr /R, winmgmt /resyncperf)' {
+            $pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib'
+            if ((Get-ItemProperty $pl -ErrorAction SilentlyContinue).'Disable Performance Counters') {
+                # a tuning tool switched off ALL counters at once; this alone is the cause in most cases
+                Set-ItemProperty $pl -Name 'Disable Performance Counters' -Value 0
+                Write-Good '   Global switch "Disable Performance Counters" is off again.'
+            }
+            try { [void](Get-Counter '\PhysicalDisk(_Total)\% Disk Time' -ErrorAction Stop); $ok = $true } catch { $ok = $false }
+            if (-not $ok) {
+                & "$env:WINDIR\System32\lodctr.exe" /R | Out-Null
+                if (Test-Path "$env:WINDIR\SysWOW64\lodctr.exe") { & "$env:WINDIR\SysWOW64\lodctr.exe" /R | Out-Null }
+            }
             & "$env:WINDIR\System32\wbem\winmgmt.exe" /resyncperf | Out-Null
             Start-Sleep -Seconds 3
             if (Get-CimClass -ClassName Win32_PerfRawData_PerfDisk_PhysicalDisk -ErrorAction SilentlyContinue) { Write-Good '   Performance counters are back.' } else { Write-Warn2 '   Not visible yet; they usually appear after a restart.' }
