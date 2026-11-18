@@ -138,6 +138,12 @@ The `typescript-lsp` plugin starts `typescript-language-server` once **per sessi
 
 **Fix:** the autopilot ends language servers that were idle for 30 minutes. Don't need them? `claude plugin disable typescript-lsp@claude-plugins-official`.
 
+### 9. 200,000 zombie processes: the AMD iGPU driver came back
+
+The next day RAM, disk and CPU were full again after a fresh reboot. `check` now counts kernel process objects: **200,288 process objects for 563 running processes** after 3 hours. Every process that exited (2,000 per minute with all the agents) stayed in kernel memory: about 27 GB of committed memory that no process owned, so Windows paged and the disk sat at 100 %.
+
+`zombieprobe test` from [claude-code-zombies](https://github.com/marloncodess/claude-code-zombies): 50 of 50 short processes stayed. Cause: the AMD Radeon iGPU of the Ryzen (driver `amdkmdag.sys` 31.0.24002.92), which drives no monitor here. It had been disabled before and was **enabled again**, most likely by Windows Update. **Fix:** disable the iGPU in Device Manager, and for good in the BIOS (Integrated Graphics: Disabled), so no update can bring it back.
+
 ## What to do, in order
 
 1. `/overclock:check` - read the findings.

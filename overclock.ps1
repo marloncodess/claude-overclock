@@ -58,7 +58,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $MinAgeBound = $PSBoundParameters.ContainsKey('MinAgeMinutes')
 $EveryBound = $PSBoundParameters.ContainsKey('Every')
-$Version = '0.3.5'
+$Version = '0.3.6'
 $RepoUrl = 'https://github.com/marloncodess/claude-overclock'
 $ZombieRepo = 'https://github.com/marloncodess/claude-code-zombies'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -386,6 +386,13 @@ function Invoke-Check([int]$sec) {
     Write-Host ('RAM {0}% used ({1} free of {2})   commit {3}%   up {4}' -f $ramPct, (Format-MB $ramFree), (Format-MB $ramTotal), $commitPct, (Format-Age $os.LastBootUpTime))
     Write-Host ('{0:N0} processes   {1:N0} threads   {2:N0} handles' -f $s.List.Count, $threads, $handles)
     if ($ramPct -ge 90) { Add-Finding 'HIGH' "RAM is $ramPct % full." 'See "Who holds the RAM" above.' } elseif ($ramPct -ge 80) { Add-Finding 'WARN' "RAM is $ramPct % full." 'See "Who holds the RAM" above.' }
+    $procType = [Overclock.Native]::Types() | Where-Object { $_.Name -eq 'Process' } | Select-Object -First 1
+    if ($procType) {
+        $zombies = $procType.Objects - $s.List.Count
+        if ($zombies -ge 5000) {
+            Add-Finding 'HIGH' ('{0:N0} zombie processes: Windows keeps exited processes in kernel memory ({1:N0} process objects for {2:N0} running processes). A driver holds them; RAM fills up without any process owning it, then the page file pushes the disk to 100 %.' -f $zombies, $procType.Objects, $s.List.Count) 'zombieprobe.ps1 scan / hunt (https://github.com/marloncodess/claude-code-zombies). Known: AMD iGPU driver amdkmdag.sys while the iGPU drives no monitor -> disable the iGPU in Device Manager or in the BIOS.'
+        }
+    }
     $mm = Get-MemoryManagerState
     if ($mm -and (-not $mm.Compression -or $mm.SysMain -ne 'Running')) {
         Add-Finding 'HIGH' ("Windows memory compression is off (MemoryCompression={0}, SysMain service {1}/{2}): when RAM is full, every page goes straight to the page file on the SSD instead of being compressed in RAM. Usually switched off by a tuning tool." -f $mm.Compression, $mm.SysMain, $mm.SysMainStart) 'overclock disk repair   (admin; turns it back on, active after a restart)'
